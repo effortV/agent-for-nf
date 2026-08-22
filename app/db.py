@@ -29,7 +29,15 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, expi
 
 def init_db() -> None:
     import_module("app.models")
-    Base.metadata.create_all(bind=engine)
+    if engine.dialect.name == "postgresql":
+        # API and multiple Workers may start together after an upgrade. PostgreSQL
+        # CREATE TABLE IF NOT EXISTS is not race-free at the system-catalog level,
+        # so serialize schema bootstrap across containers with a transaction lock.
+        with engine.begin() as connection:
+            connection.exec_driver_sql("SELECT pg_advisory_xact_lock(721904231584029)")
+            Base.metadata.create_all(bind=connection)
+    else:
+        Base.metadata.create_all(bind=engine)
 
 
 def get_db() -> Generator[Session, None, None]:
