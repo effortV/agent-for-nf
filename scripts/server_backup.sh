@@ -54,7 +54,7 @@ echo "[1/7] Quiescing API and workers..."
 echo "[2/7] Dumping PostgreSQL..."
 "${COMPOSE[@]}" exec -T postgres pg_dump -U nfagent -d nfagent -Fc > "${PARTIAL_DIR}/postgres.dump"
 "${COMPOSE[@]}" exec -T postgres psql -U nfagent -d nfagent -At -c \
-  "SELECT 'documents='||count(*) FROM documents UNION ALL SELECT 'chunks='||count(*) FROM chunks UNION ALL SELECT 'facts='||count(*) FROM extracted_facts UNION ALL SELECT 'jobs='||count(*) FROM import_jobs UNION ALL SELECT 'conversations='||count(*) FROM conversations ORDER BY 1;" \
+  "SELECT 'chunks='||count(*) FROM chunks UNION ALL SELECT 'conversations='||count(*) FROM conversations UNION ALL SELECT 'discovery_candidates='||count(*) FROM discovery_candidates UNION ALL SELECT 'documents='||count(*) FROM documents UNION ALL SELECT 'extracted_facts='||count(*) FROM extracted_facts UNION ALL SELECT 'import_jobs='||count(*) FROM import_jobs UNION ALL SELECT 'knowledge_bases='||count(*) FROM knowledge_bases UNION ALL SELECT 'knowledge_insights='||count(*) FROM knowledge_insights UNION ALL SELECT 'literature_automations='||count(*) FROM literature_automations UNION ALL SELECT 'messages='||count(*) FROM messages UNION ALL SELECT 'task_controls='||count(*) FROM task_controls UNION ALL SELECT 'training_traces='||count(*) FROM training_traces ORDER BY 1;" \
   > "${PARTIAL_DIR}/database-counts.txt"
 
 echo "[3/7] Stopping mutable data services for consistent volume archives..."
