@@ -8,15 +8,31 @@ from urllib.parse import quote
 import httpx
 import streamlit as st
 
-
 API_URL = os.getenv("API_BASE_URL", "http://localhost:8000").rstrip("/") + "/api"
-st.set_page_config(page_title="NF-Atlas 纳滤智能体", page_icon="🧪", layout="wide")
+if os.getenv("STREAMLIT_PAGE_CONFIGURED", "").casefold() not in {"1", "true", "yes", "on"}:
+    st.set_page_config(page_title="NF-Atlas 纳滤智能体", page_icon="🧪", layout="wide")
 CLOUD_MODE = os.getenv("STREAMLIT_CLOUD_MODE", "").casefold() in {"1", "true", "yes", "on"}
+REMOTE_BACKEND = os.getenv("STREAMLIT_REMOTE_BACKEND", "").casefold() in {"1", "true", "yes", "on"}
+
+
+def _api_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    token = os.getenv("NF_API_ACCESS_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    client_id = os.getenv("CF_ACCESS_CLIENT_ID", "").strip()
+    client_secret = os.getenv("CF_ACCESS_CLIENT_SECRET", "").strip()
+    if client_id and client_secret:
+        headers["CF-Access-Client-Id"] = client_id
+        headers["CF-Access-Client-Secret"] = client_secret
+    return headers
 
 
 def api(method: str, path: str, **kwargs: Any) -> Any:
     try:
-        response = httpx.request(method, API_URL + path, timeout=600, **kwargs)
+        headers = _api_headers()
+        headers.update(kwargs.pop("headers", {}) or {})
+        response = httpx.request(method, API_URL + path, timeout=600, headers=headers, **kwargs)
         response.raise_for_status()
         if response.status_code == 204:
             return None
@@ -33,7 +49,7 @@ def api(method: str, path: str, **kwargs: Any) -> Any:
 
 def api_bytes(path: str) -> bytes:
     try:
-        response = httpx.get(API_URL + path, timeout=600)
+        response = httpx.get(API_URL + path, timeout=600, headers=_api_headers())
         response.raise_for_status()
         return response.content
     except httpx.HTTPError as exc:
@@ -62,8 +78,8 @@ def render_sidebar() -> str:
     with st.sidebar:
         st.title("🧪 NF-Atlas")
         st.caption("纳滤领域知识 + LLM 垂直 Agent")
-        if CLOUD_MODE:
-            st.caption("☁️ Streamlit Cloud 版 · 数据会随云端实例休眠或重建而重置")
+        if CLOUD_MODE and REMOTE_BACKEND:
+            st.caption("☁️ 云前端 · 数据、文献和后台任务保存在服务器主库；前端休眠不会丢失")
         if st.session_state.pop("conversation_deleted", None):
             st.success("对话已删除；知识库和已入库文献仍然保留。")
         conversations = load_conversations()
@@ -208,6 +224,7 @@ def render_job(
             ("indexed", "入库"),
             ("failed", "失败"),
         ],
+        strict=True,
     ):
         col.metric(label, counts.get(key, 0))
     def render_logs() -> None:

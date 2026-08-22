@@ -7,9 +7,9 @@ NF-Atlas 是面向纳滤研究的可持久化垂直智能体。核心大模型�
 项目已实现一条端到端工程链：
 
 ```text
-Streamlit 三大模块：上下文对话 / 文献采集与阅读 / 知识发现图谱
-          │
-       FastAPI ── PostgreSQL（对话、任务、文献、证据、训练轨迹）
+Streamlit Cloud 公开前端（无知识库数据）
+          │ 受限 SSH 转发或 HTTPS/Cloudflare Tunnel
+       服务器 FastAPI ── PostgreSQL（对话、任务、文献、证据、训练轨迹）
           │
    LangGraph 问题路由              Redis/RQ 后台任务
       ├─ Neo4j/SQL facts              ├─ DeepSeek 词表扩展
@@ -148,9 +148,23 @@ streamlit run ui/streamlit_app.py --server.port 8501
 
 ## Streamlit Community Cloud 部署
 
-云端入口为 `streamlit_cloud.py`。它会在同一 Streamlit 实例内启动 FastAPI，并使用 SQLite、本地对象目录、Chroma 持久目录和哈希向量降级，因此无需在 Community Cloud 中运行 Docker。请在 Streamlit Secrets 中配置 `SILICONFLOW_API_KEY`、`OPENALEX_API_KEY`、`OPENALEX_EMAIL`、`UNPAYWALL_EMAIL`、`ELSEVIER_API_KEY` 等凭据；任何真实密钥都不得提交到 GitHub。
+云端入口为 `streamlit_cloud.py`，它现在是**纯前端**：不会在 Streamlit 实例内启动 FastAPI、SQLite、Chroma 或后台 Worker，也不会保存 PDF、向量或对话。正式主库和全部任务只运行在长期在线服务器上。Streamlit Cloud 休眠、重启或重建后会重新连接同一服务器，因此不会清空文献、知识图谱、向量、任务或对话；服务器 Worker 在网页关闭期间仍继续运行。
 
-Community Cloud 的本地磁盘会在实例重建时重置，也不支持本项目的 Redis/RQ、Neo4j、MinIO、GROBID 与独立 Worker 完整拓扑。公开演示和轻量采集可使用云端版；长期保存知识库、后台队列和全文文件仍应使用 D 盘 Docker 完整版。
+推荐使用专用受限 SSH 密钥，把云前端转发到服务器回环地址 `127.0.0.1:8000`。该密钥在服务器 `authorized_keys` 中只能转发这个端口，不能打开 Shell、PTY、代理转发或其他端口。将 [.streamlit/server-secrets.example.toml](.streamlit/server-secrets.example.toml) 的内容复制到 Community Cloud 的 **App settings → Secrets**，替换主机、指纹和私钥。真实私钥只能放 Secrets，绝不能提交到 GitHub。
+
+Streamlit Secrets 只需要服务器连接信息，不再填写 SiliconFlow、OpenAlex、Elsevier、PostgreSQL、Neo4j 或 MinIO 密钥；这些凭据全部留在服务器 `.env`。仓库根目录的 `requirements.txt` 也只安装云前端所需的 Streamlit、HTTPX 和 Paramiko，不再在云端下载 PyTorch、Chroma 或解析器依赖。
+
+在 Community Cloud 中选择：
+
+```text
+Repository: effortV/agent-for-nf
+Branch: main
+Main file path: streamlit_cloud.py
+```
+
+如果后续已有可信 HTTPS 反向代理或 Cloudflare Tunnel，也可以只设置 `NF_BACKEND_URL=https://...`；可选的 Bearer/Cloudflare Access 服务令牌字段已列在 Secrets 示例中。程序默认拒绝纯 HTTP 公网地址。
+
+云前端只是服务器主库的操作界面。所有访问者目前共享同一个知识库和对话列表，因此只应把应用链接发给可信协作者；需要面向不受信任公众开放时，还应增加用户登录、权限分级、租户隔离和配额。
 
 ## MinerU 接入
 
@@ -206,7 +220,7 @@ python -m app.cli export-training --include-unapproved
 - 本机模式的数据位于 `data/runtime/`；此目录已被 Git 忽略。
 - 文献对象键按 `kb/{knowledge_base_id}/documents/{document_id}/` 隔离。
 - 每个回答保存索引版本和证据；即使索引日后扩充，旧回答的证据快照仍在 PostgreSQL。
-- API 目前面向单机/受信任内网。对公网开放前应在反向代理层增加身份认证、TLS、速率限制、上传扫描、租户隔离和审计策略。
+- FastAPI 继续只绑定服务器 `127.0.0.1:8000`；Streamlit Cloud 使用受限 SSH 端口转发访问，不需要开放 API 端口。若改为公网 HTTPS 反向代理，应增加身份认证、TLS、速率限制、上传扫描、租户隔离和审计策略。
 
 ## 测试
 
