@@ -6,5 +6,5 @@ FROM ${BASE_IMAGE}
 WORKDIR /app
 COPY app ./app
 COPY ui ./ui
+COPY scripts ./scripts
 COPY streamlit_cloud.py ./streamlit_cloud.py
-
