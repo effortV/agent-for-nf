@@ -4,6 +4,7 @@ set -Eeuo pipefail
 PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_ROOT="${BACKUP_ROOT:-${PROJECT_ROOT}/backups}"
 RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
+RESTART_SERVICES="${BACKUP_RESTART_SERVICES:-true}"
 ARCHIVE_IMAGE="${BACKUP_ARCHIVE_IMAGE:-docker.1ms.run/library/postgres:16-alpine}"
 STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 PARTIAL_DIR="${BACKUP_ROOT}/.partial-${STAMP}"
@@ -13,6 +14,10 @@ LOCK_FILE="${BACKUP_ROOT}/.backup.lock"
 case "${BACKUP_ROOT}" in
   "${PROJECT_ROOT}/backups"|"${PROJECT_ROOT}/backups/"*) ;;
   *) echo "BACKUP_ROOT must stay inside ${PROJECT_ROOT}/backups" >&2; exit 2 ;;
+esac
+case "${RESTART_SERVICES}" in
+  true|false) ;;
+  *) echo "BACKUP_RESTART_SERVICES must be true or false" >&2; exit 2 ;;
 esac
 
 mkdir -p -- "${BACKUP_ROOT}"
@@ -96,8 +101,12 @@ printf 'created_utc=%s\nproject_root=%s\nredis_restore=worker_recovery_from_post
 sync
 mv -- "${PARTIAL_DIR}" "${FINAL_DIR}"
 
-echo "[7/7] Restarting services and applying retention..."
-restore_services
+echo "[7/7] Finalizing service state and applying retention..."
+if [[ "${RESTART_SERVICES}" == "true" ]]; then
+  restore_services
+else
+  echo "Backup complete; API and workers remain stopped for migration cutover."
+fi
 trap - EXIT
 
 if [[ "${RETENTION_DAYS}" =~ ^[0-9]+$ ]] && (( RETENTION_DAYS > 0 )); then
