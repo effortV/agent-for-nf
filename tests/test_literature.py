@@ -77,6 +77,28 @@ def test_safe_error_never_contains_query_secrets() -> None:
     assert "?" not in safe["endpoint"]
 
 
+def test_elsevier_safe_error_exposes_service_code_without_response_text() -> None:
+    request = httpx.Request("GET", "https://api.elsevier.com/content/search/sciencedirect?apiKey=secret")
+    response = httpx.Response(
+        401,
+        request=request,
+        json={
+            "service-error": {
+                "status": {
+                    "statusCode": "AUTHORIZATION_ERROR",
+                    "statusText": "sensitive upstream detail",
+                }
+            }
+        },
+    )
+    safe = LiteratureDiscovery._safe_error(
+        httpx.HTTPStatusError("unauthorized", request=request, response=response)
+    )
+    assert safe["service_code"] == "AUTHORIZATION_ERROR"
+    assert "sensitive upstream detail" not in json.dumps(safe)
+    assert "secret" not in json.dumps(safe)
+
+
 def test_elsevier_search_builds_public_pii_landing_url() -> None:
     async def exercise() -> None:
         def handler(request: httpx.Request) -> httpx.Response:

@@ -286,12 +286,20 @@ class FullTextResolver:
         if response.status_code == 404:
             return None
         if response.status_code == 401:
+            service_code = self._elsevier_service_code(response)
+            if service_code == "AUTHORIZATION_ERROR":
+                raise ElsevierEntitlementError(
+                    "HTTP 401（AUTHORIZATION_ERROR）：当前 Key/服务器出口没有 Article Retrieval FULL 权限"
+                )
             raise ElsevierAuthenticationError(
-                "HTTP 401：Elsevier API Key 无效、已停用，或未启用 Article Retrieval API"
+                f"HTTP 401{f'（{service_code}）' if service_code else ''}："
+                "Elsevier API Key 无效、已停用，或未启用 Article Retrieval API"
             )
         if response.status_code == 403:
+            service_code = self._elsevier_service_code(response)
             raise ElsevierEntitlementError(
-                "HTTP 403：API Key 已被识别，但当前服务器 IP/Insttoken 没有该文献的 ScienceDirect FULL 权限"
+                f"HTTP 403{f'（{service_code}）' if service_code else ''}："
+                "当前 Key/服务器 IP/Insttoken 配置不足，无法取得该文献的 ScienceDirect FULL 正文"
             )
         if response.status_code == 429:
             raise ValueError("HTTP 429：Elsevier API 配额或速率限制，请稍后重试")
@@ -314,6 +322,14 @@ class FullTextResolver:
             sha256=sha256_bytes(content),
             doi=value if identifier_type == "doi" else None,
         )
+
+    @staticmethod
+    def _elsevier_service_code(response: httpx.Response) -> str | None:
+        try:
+            status = (response.json().get("service-error") or {}).get("status") or {}
+            return str(status.get("statusCode") or "").strip() or None
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def extract_elsevier_pii(*urls_or_identifiers: str | None) -> str | None:

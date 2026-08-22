@@ -44,13 +44,13 @@ async def main() -> None:
             try:
                 rows = await discovery._search_elsevier("nanofiltration membrane", 1, None, None)
                 report["elsevier"] = {
-                    "api_key_valid": True,
+                    "key_configured": True,
                     "metadata_search": {"ok": True, "result_count": len(rows)},
                     "insttoken_configured": bool(settings.elsevier_insttoken),
                 }
             except Exception as exc:
                 report["elsevier"] = {
-                    "api_key_valid": False,
+                    "key_configured": True,
                     "metadata_search": {"ok": False, "error": discovery._safe_error(exc)},
                     "insttoken_configured": bool(settings.elsevier_insttoken),
                 }
@@ -80,18 +80,21 @@ async def main() -> None:
                 "ok": result is not None,
                 "content_mode": "FULL XML" if result else "not_found",
             }
+            elsevier_report["key_recognized_by_article_api"] = result is not None
         except ElsevierAuthenticationError as exc:
             elsevier_report["fulltext_tdm"] = {
                 "ok": False,
                 "reason": "api_key_authentication",
                 "message": str(exc),
             }
+            elsevier_report["key_recognized_by_article_api"] = False
         except ElsevierEntitlementError as exc:
             elsevier_report["fulltext_tdm"] = {
                 "ok": False,
                 "reason": "institutional_entitlement",
                 "message": str(exc),
             }
+            elsevier_report["key_recognized_by_article_api"] = True
         except Exception as exc:
             elsevier_report["fulltext_tdm"] = {
                 "ok": False,

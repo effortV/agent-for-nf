@@ -182,11 +182,20 @@ class LiteratureDiscovery:
         if isinstance(exc, httpx.HTTPStatusError):
             request_url = exc.request.url
             error_type = "circuit_open" if "circuit open" in str(exc).casefold() else "http_status"
-            return {
+            result = {
                 "type": error_type,
                 "status_code": exc.response.status_code,
                 "endpoint": f"{request_url.scheme}://{request_url.host}{request_url.path}",
             }
+            if request_url.host == "api.elsevier.com":
+                try:
+                    status = (exc.response.json().get("service-error") or {}).get("status") or {}
+                    service_code = str(status.get("statusCode") or "").strip()
+                    if service_code:
+                        result["service_code"] = service_code
+                except (TypeError, ValueError):
+                    pass
+            return result
         if isinstance(exc, httpx.TimeoutException):
             return {"type": "timeout"}
         if isinstance(exc, httpx.RequestError):

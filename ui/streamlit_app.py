@@ -360,9 +360,20 @@ def render_connector_status(connector_status: dict[str, Any]) -> None:
         state = connector.get("status")
         errors = connector.get("errors") or []
         http_code = errors[0].get("status_code") if errors else None
+        service_code = errors[0].get("service_code") if errors else None
         if state not in {"error", "degraded", "not_configured"}:
             continue
-        if name == "elsevier" and http_code == 401:
+        if name == "elsevier" and service_code == "AUTHORIZATION_ERROR":
+            st.warning(
+                f"Elsevier 返回 HTTP {http_code}（AUTHORIZATION_ERROR）：新 Key 已发送，但该应用/当前出口网络"
+                "尚无 ScienceDirect Search API 权限。请从学校订阅网络重试，或联系 Elsevier/API 管理员开通。"
+            )
+        elif name == "elsevier" and service_code == "AUTHENTICATION_ERROR":
+            st.warning(
+                f"Elsevier 返回 HTTP {http_code}（AUTHENTICATION_ERROR）：请求者配置不足。"
+                "请检查 Developer Portal 中的 Key/API 产品，并使用学校订阅 IP 或官方 Insttoken。"
+            )
+        elif name == "elsevier" and http_code == 401:
             st.warning(
                 "Elsevier 返回 HTTP 401：Key 无效、已停用，或尚未启用当前 API。"
                 "请在 Developer Portal 检查应用；系统不会使用或保存学校账号密码。"

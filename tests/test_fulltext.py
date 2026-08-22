@@ -169,6 +169,34 @@ def test_elsevier_meta_abs_is_not_mislabeled_as_fulltext() -> None:
     asyncio.run(exercise())
 
 
+def test_elsevier_403_reports_upstream_service_code() -> None:
+    async def exercise() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                403,
+                request=request,
+                json={
+                    "service-error": {
+                        "status": {
+                            "statusCode": "AUTHENTICATION_ERROR",
+                            "statusText": "Requestor configuration settings insufficient",
+                        }
+                    }
+                },
+            )
+
+        resolver = FullTextResolver(Settings(elsevier_api_key="key-test"))
+        await resolver.client.aclose()
+        resolver.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(ElsevierEntitlementError, match="AUTHENTICATION_ERROR"):
+                await resolver._from_elsevier("10.1000/nf.1")
+        finally:
+            await resolver.close()
+
+    asyncio.run(exercise())
+
+
 def test_elsevier_pii_is_extracted_from_sciencedirect_urls() -> None:
     assert (
         FullTextResolver.extract_elsevier_pii(
