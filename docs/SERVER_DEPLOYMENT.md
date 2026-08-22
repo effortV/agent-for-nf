@@ -12,7 +12,7 @@
 
 ```bash
 cd "/home/root2/data/zzh/agent for nf"
-docker compose \
+scripts/server_compose.sh \
   -f docker-compose.yml \
   -f docker-compose.server.yml \
   --profile docker-ui up -d
@@ -72,4 +72,3 @@ NF_ATLAS_ALLOW_RESTORE=YES scripts/server_restore.sh \
 ```
 
 Redis 队列不直接还原，避免陈旧 RQ 调用重复执行。Worker 会从 PostgreSQL 的任务记录安全恢复，数据库唯一约束和四级查重会跳过已经入库的文献。
-

@@ -31,7 +31,7 @@ mkdir -p -- "${PARTIAL_DIR}"
 chmod 700 "${PARTIAL_DIR}"
 
 COMPOSE=(
-  docker compose
+  "${PROJECT_ROOT}/scripts/server_compose.sh"
   --project-directory "${PROJECT_ROOT}"
   -f "${PROJECT_ROOT}/docker-compose.yml"
   -f "${PROJECT_ROOT}/docker-compose.server.yml"

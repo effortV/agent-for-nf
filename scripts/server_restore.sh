@@ -25,7 +25,7 @@ done
 (cd "${SNAPSHOT}" && sha256sum -c SHA256SUMS)
 
 COMPOSE=(
-  docker compose
+  "${PROJECT_ROOT}/scripts/server_compose.sh"
   --project-directory "${PROJECT_ROOT}"
   -f "${PROJECT_ROOT}/docker-compose.yml"
   -f "${PROJECT_ROOT}/docker-compose.server.yml"
@@ -62,4 +62,3 @@ until "${COMPOSE[@]}" exec -T postgres pg_isready -U nfagent -d nfagent >/dev/nu
 echo "Starting the complete server stack..."
 "${COMPOSE[@]}" up -d postgres redis neo4j minio chroma grobid api worker priority-worker ui
 echo "Restore submitted. Run scripts/server_status.sh until all health checks pass."
-
