@@ -12,3 +12,5 @@ data/runtime/
 chroma/
 objects/
 models/
+backups/
+migration/
