@@ -10,7 +10,14 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import AutomationStatus, ImportJob, JobStatus, LiteratureAutomation
 from app.services.pipeline import append_job_log
-from app.services.task_control import PAUSE_STATES, CANCEL_STATES, automation_is_deleted, get_job_control
+from app.services.task_control import (
+    CANCEL_STATES,
+    PAUSE_REQUESTED,
+    PAUSE_STATES,
+    automation_is_deleted,
+    get_job_control,
+    normalize_interrupted_pause,
+)
 
 
 RECOVERABLE_IMPORT_STATES = {
@@ -183,6 +190,14 @@ def recover_interrupted_tasks(connection: Any, queue: Any) -> dict[str, int]:
         ]
         for import_job in imports:
             control = get_job_control(db, import_job.id)
+            if control and control.state == PAUSE_REQUESTED:
+                if normalize_interrupted_pause(import_job, control):
+                    append_job_log(
+                        import_job,
+                        "paused",
+                        "Worker 重启时任务正在安全暂停，现已转为可点击开始/继续的暂停状态",
+                    )
+                continue
             if control and (control.deleted or control.state in PAUSE_STATES or control.state in CANCEL_STATES):
                 continue
             if import_job.id in automation_job_ids:

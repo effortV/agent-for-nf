@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import ImportJob, LiteratureAutomation, TaskControl
+from app.models import ImportJob, JobStatus, LiteratureAutomation, TaskControl
 
 
 ACTIVE = "active"
@@ -56,6 +56,42 @@ def clear_job_control(db: Session, job: ImportJob) -> TaskControl:
     control.state = ACTIVE
     control.requested_at = datetime.now(timezone.utc)
     return control
+
+
+def normalize_interrupted_pause(job: ImportJob, control: TaskControl) -> bool:
+    """Turn an in-flight pause request into a resumable pause after Worker restart."""
+
+    if control.state != PAUSE_REQUESTED:
+        return False
+    control.state = PAUSED
+    counts = dict(job.counts or {})
+    counts["execution_state"] = "paused"
+    job.counts = counts
+    job.status = JobStatus.queued
+    job.stage = "已暂停；点击开始/继续任务"
+    return True
+
+
+def import_rq_call_is_running(job: ImportJob) -> bool:
+    """Best-effort duplicate guard for the explicit Start button."""
+
+    settings = get_settings()
+    execution_state = str((job.counts or {}).get("execution_state") or "")
+    if not settings.use_rq:
+        return execution_state in {"running", "pausing", "cancelling"}
+    rq_id = str((job.counts or {}).get("rq_job_id") or "").strip()
+    if not rq_id:
+        return execution_state == "running"
+    try:
+        from redis import Redis
+        from rq.job import Job
+
+        rq_job = Job.fetch(rq_id, connection=Redis.from_url(settings.redis_url))
+        status = rq_job.get_status(refresh=True)
+        value = getattr(status, "value", str(status)).casefold()
+        return value == "started"
+    except Exception:
+        return execution_state == "running"
 
 
 def automation_is_deleted(automation: LiteratureAutomation) -> bool:

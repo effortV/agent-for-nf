@@ -12,6 +12,7 @@ from app.services.task_control import (
     automation_is_deleted,
     get_job_control,
     mark_automation_deleted,
+    normalize_interrupted_pause,
     request_job_control,
 )
 
@@ -41,6 +42,19 @@ def test_pause_request_becomes_durable_paused_checkpoint() -> None:
     assert apply_control_checkpoint(db, job) == PAUSED
     assert get_job_control(db, job.id).state == PAUSED
     assert job.status == JobStatus.queued
+    assert job.counts["execution_state"] == "paused"
+
+
+def test_worker_restart_turns_pause_request_into_startable_pause() -> None:
+    db = make_session()
+    job = make_job(db)
+    control = request_job_control(db, job, PAUSE_REQUESTED)
+    db.commit()
+
+    assert normalize_interrupted_pause(job, control) is True
+    assert control.state == PAUSED
+    assert job.status == JobStatus.queued
+    assert job.stage == "已暂停；点击开始/继续任务"
     assert job.counts["execution_state"] == "paused"
 
 

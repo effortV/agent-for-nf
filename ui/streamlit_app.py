@@ -235,23 +235,23 @@ def render_job_controls(job: dict[str, Any], *, key_prefix: str) -> None:
     job_id = job["id"]
     control_state = job.get("control_state") or "active"
     status = job.get("status")
+    execution_state = str((job.get("counts") or {}).get("execution_state") or "legacy")
     controls = st.columns([1, 1, 1.3, 1.2, 4])
     if status not in {"completed", "failed", "awaiting_selection"}:
-        if control_state == "paused":
-            if controls[0].button("继续任务", key=f"{key_prefix}-resume-{job_id}", use_container_width=True):
+        startable = control_state in {"paused", "pause_requested"} or execution_state != "running"
+        if startable:
+            if controls[0].button(
+                "开始/继续",
+                key=f"{key_prefix}-start-{job_id}",
+                type="primary" if control_state in {"paused", "pause_requested"} else "secondary",
+                use_container_width=True,
+            ):
                 try:
-                    result = api("POST", f"/jobs/{job_id}/resume")
-                    st.session_state.processing_notice = result.get("message") or "任务已继续"
+                    result = api("POST", f"/jobs/{job_id}/start")
+                    st.session_state.processing_notice = result.get("message") or "任务已开始"
                     st.rerun()
                 except RuntimeError as exc:
                     st.error(str(exc))
-        elif control_state == "pause_requested":
-            controls[0].button(
-                "暂停中…",
-                key=f"{key_prefix}-pausing-{job_id}",
-                disabled=True,
-                use_container_width=True,
-            )
         else:
             if controls[0].button("暂停", key=f"{key_prefix}-pause-{job_id}", use_container_width=True):
                 try:

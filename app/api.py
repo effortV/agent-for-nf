@@ -73,12 +73,14 @@ from app.services.graph_store import GraphStore
 from app.services.storage import ObjectStorage
 from app.services.training import trace_to_read, traces_to_jsonl, training_quality
 from app.services.task_control import (
+    CANCEL_STATES,
     CANCEL_REQUESTED,
     PAUSE_REQUESTED,
     PAUSED,
     automation_is_deleted,
     clear_job_control,
     get_job_control,
+    import_rq_call_is_running,
     mark_automation_deleted,
     remove_queued_automation_calls,
     remove_queued_import_calls,
@@ -397,23 +399,44 @@ def pause_job(job_id: str, db: Db) -> JobControlRead:
     return JobControlRead(job_id=job.id, state=control.state, deleted=control.deleted, message=message)
 
 
-@router.post("/jobs/{job_id}/resume", response_model=JobControlRead)
-def resume_job(job_id: str, background_tasks: BackgroundTasks, db: Db) -> JobControlRead:
+@router.post("/jobs/{job_id}/start", response_model=JobControlRead)
+def start_job(job_id: str, background_tasks: BackgroundTasks, db: Db) -> JobControlRead:
     job = get_job_or_404(db, job_id)
+    if job.status in {JobStatus.completed, JobStatus.failed, JobStatus.awaiting_selection}:
+        raise HTTPException(409, "该任务当前状态不能开始；等待选择的任务请先确认文献")
     control = get_job_control(db, job.id)
-    if control is None or control.state != PAUSED:
+    if control and (control.deleted or control.state in CANCEL_STATES):
+        raise HTTPException(409, "该任务已经取消或删除，不能再次开始")
+    automation = db.scalar(select(LiteratureAutomation).where(LiteratureAutomation.last_job_id == job.id))
+    if import_rq_call_is_running(job):
         if control and control.state == PAUSE_REQUESTED:
-            raise HTTPException(409, "任务正在到达安全暂停点，请稍后再继续")
-        raise HTTPException(409, "该任务没有处于已暂停状态")
+            clear_job_control(db, job)
+            counts = dict(job.counts or {})
+            counts["execution_state"] = "running"
+            job.counts = counts
+            current = dict(counts.get("current_document") or {})
+            job.stage = current.get("stage") or "已撤销暂停，继续当前任务"
+            append_job_log(job, "started", "用户点击开始/继续，已撤销尚未生效的暂停请求")
+            if automation and not automation_is_deleted(automation):
+                automation.stop_requested = False
+                automation.status = AutomationStatus.running
+                automation.error_message = None
+            db.commit()
+            return JobControlRead(
+                job_id=job.id,
+                state="active",
+                deleted=False,
+                message="已撤销暂停，当前任务继续执行",
+            )
+        raise HTTPException(409, "Worker 仍在处理当前文献；到达安全暂停点后即可开始/继续")
     clear_job_control(db, job)
     job.status = JobStatus.queued
-    job.stage = "已继续，等待 Worker"
+    job.stage = "已开始，等待 Worker"
     job.error_message = None
     counts = dict(job.counts or {})
     counts["execution_state"] = "queued"
     job.counts = counts
-    append_job_log(job, "resumed", "用户继续任务，已重新进入后台队列")
-    automation = db.scalar(select(LiteratureAutomation).where(LiteratureAutomation.last_job_id == job.id))
+    append_job_log(job, "started", "用户点击开始/继续，任务已重新进入后台队列")
     if automation and not automation_is_deleted(automation):
         automation.stop_requested = False
         automation.status = AutomationStatus.running
@@ -430,7 +453,7 @@ def resume_job(job_id: str, background_tasks: BackgroundTasks, db: Db) -> JobCon
             counts = dict(job.counts or {})
             counts["execution_state"] = "paused"
             job.counts = counts
-            job.stage = "继续失败，任务仍保持暂停"
+            job.stage = "开始失败，任务仍保持暂停"
             automation.stop_requested = True
             automation.status = AutomationStatus.stopped
             automation.error_message = f"{type(exc).__name__}: 无法连接 Redis/RQ"
@@ -438,7 +461,16 @@ def resume_job(job_id: str, background_tasks: BackgroundTasks, db: Db) -> JobCon
             raise HTTPException(502, automation.error_message) from exc
     elif not enqueue_import(job.id, high_priority=is_priority_job(job)):
         background_tasks.add_task(run_import_job, job.id)
-    return JobControlRead(job_id=job.id, state="active", deleted=False, message="任务已继续")
+    return JobControlRead(job_id=job.id, state="active", deleted=False, message="任务已开始")
+
+
+@router.post("/jobs/{job_id}/resume", response_model=JobControlRead)
+def resume_job(job_id: str, background_tasks: BackgroundTasks, db: Db) -> JobControlRead:
+    job = get_job_or_404(db, job_id)
+    control = get_job_control(db, job.id)
+    if control is None or control.state not in {PAUSED, PAUSE_REQUESTED}:
+        raise HTTPException(409, "该任务没有处于暂停或等待暂停状态")
+    return start_job(job_id, background_tasks, db)
 
 
 @router.delete("/jobs/{job_id}", response_model=JobControlRead)
