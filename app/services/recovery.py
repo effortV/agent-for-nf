@@ -10,6 +10,7 @@ from app.config import get_settings
 from app.db import SessionLocal
 from app.models import AutomationStatus, ImportJob, JobStatus, LiteratureAutomation
 from app.services.pipeline import append_job_log
+from app.services.task_control import PAUSE_STATES, CANCEL_STATES, automation_is_deleted, get_job_control
 
 
 RECOVERABLE_IMPORT_STATES = {
@@ -110,8 +111,11 @@ def recover_interrupted_tasks(connection: Any, queue: Any) -> dict[str, int]:
         automations = [
             item
             for item in automations
-            if item.status in {AutomationStatus.active, AutomationStatus.running, AutomationStatus.stopping}
-            or (item.status == AutomationStatus.failed and is_retryable_database_error(item.error_message))
+            if not automation_is_deleted(item)
+            and (
+                item.status in {AutomationStatus.active, AutomationStatus.running, AutomationStatus.stopping}
+                or (item.status == AutomationStatus.failed and is_retryable_database_error(item.error_message))
+            )
         ]
         automation_job_ids = {item.last_job_id for item in automations if item.last_job_id}
         for automation in automations:
@@ -178,6 +182,9 @@ def recover_interrupted_tasks(connection: Any, queue: Any) -> dict[str, int]:
             or (item.status == JobStatus.failed and is_retryable_database_error(item.error_message))
         ]
         for import_job in imports:
+            control = get_job_control(db, import_job.id)
+            if control and (control.deleted or control.state in PAUSE_STATES or control.state in CANCEL_STATES):
+                continue
             if import_job.id in automation_job_ids:
                 continue
             priority = is_priority_import(import_job)

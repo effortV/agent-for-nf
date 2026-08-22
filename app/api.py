@@ -44,6 +44,7 @@ from app.schemas import (
     FeedbackRequest,
     HealthRead,
     ImportSelectionRequest,
+    JobControlRead,
     JobRead,
     KnowledgeInsightRead,
     KnowledgeInsightReview,
@@ -59,15 +60,30 @@ from app.schemas import (
 )
 from app.services.dedupe import extract_doi, find_duplicate, normalize_doi, sha256_bytes, title_author_fingerprint
 from app.services.discovery_service import DiscoveryService, candidates_for_job
-from app.services.automation import enqueue_automation_cycle
+from app.services.automation import (
+    enqueue_automation_cycle,
+    enqueue_automation_resume_cycle,
+)
 from app.services.import_service import ImportSelectionError, create_documents_from_candidates
 from app.services.fulltext import FullTextResolver
-from app.services.pipeline import append_job_log, run_import_job
+from app.services.pipeline import apply_control_checkpoint, append_job_log, run_import_job
 from app.services.queue import enqueue_import
 from app.services.rag import NanofiltrationRAGAgent
 from app.services.graph_store import GraphStore
 from app.services.storage import ObjectStorage
 from app.services.training import trace_to_read, traces_to_jsonl, training_quality
+from app.services.task_control import (
+    CANCEL_REQUESTED,
+    PAUSE_REQUESTED,
+    PAUSED,
+    automation_is_deleted,
+    clear_job_control,
+    get_job_control,
+    mark_automation_deleted,
+    remove_queued_automation_calls,
+    remove_queued_import_calls,
+    request_job_control,
+)
 
 
 router = APIRouter(prefix="/api")
@@ -79,6 +95,19 @@ def get_or_404(db: Session, model: type, identifier: str):
     if value is None:
         raise HTTPException(status_code=404, detail=f"{model.__name__} 不存在")
     return value
+
+
+def get_job_or_404(db: Session, job_id: str) -> ImportJob:
+    job = get_or_404(db, ImportJob, job_id)
+    if job.deleted:
+        raise HTTPException(status_code=404, detail="ImportJob 不存在或已删除")
+    return job
+
+
+def is_priority_job(job: ImportJob) -> bool:
+    if bool((job.counts or {}).get("priority")):
+        return True
+    return (job.query or "").strip().startswith(("用户上传：", "公开网址/DOI 导入：", "重新获取公开全文："))
 
 
 def candidate_to_schema(item: DiscoveryCandidate) -> CandidateRead:
@@ -322,7 +351,7 @@ async def discover(payload: DiscoveryRequest, db: Db) -> DiscoveryResponse:
 
 @router.get("/jobs/{job_id}", response_model=JobRead)
 def get_job(job_id: str, db: Db) -> ImportJob:
-    return get_or_404(db, ImportJob, job_id)
+    return get_job_or_404(db, job_id)
 
 
 @router.get("/knowledge-bases/{knowledge_base_id}/jobs", response_model=list[JobRead])
@@ -336,13 +365,114 @@ def list_knowledge_base_jobs(
     statement = select(ImportJob).where(ImportJob.knowledge_base_id == knowledge_base_id)
     if active_only:
         statement = statement.where(ImportJob.status.not_in((JobStatus.completed, JobStatus.failed)))
-    statement = statement.order_by(ImportJob.updated_at.desc()).limit(max(1, min(limit, 200)))
-    return list(db.scalars(statement))
+    requested_limit = max(1, min(limit, 200))
+    rows = list(db.scalars(statement.order_by(ImportJob.updated_at.desc()).limit(1000)))
+    return [item for item in rows if not item.deleted][:requested_limit]
+
+
+@router.post("/jobs/{job_id}/pause", response_model=JobControlRead)
+def pause_job(job_id: str, db: Db) -> JobControlRead:
+    job = get_job_or_404(db, job_id)
+    if job.status in {JobStatus.completed, JobStatus.failed, JobStatus.awaiting_selection}:
+        raise HTTPException(409, "该任务当前状态不能暂停")
+    execution_state = str((job.counts or {}).get("execution_state") or "queued")
+    state = PAUSE_REQUESTED if execution_state == "running" else PAUSED
+    control = request_job_control(db, job, state)
+    counts = dict(job.counts or {})
+    counts["execution_state"] = "pausing" if state == PAUSE_REQUESTED else "paused"
+    job.counts = counts
+    job.stage = "正在完成当前单篇后暂停" if state == PAUSE_REQUESTED else "已暂停；可继续任务"
+    append_job_log(job, "pause_requested", "用户请求暂停；将在当前单篇安全点生效")
+    automation = db.scalar(select(LiteratureAutomation).where(LiteratureAutomation.last_job_id == job.id))
+    if automation and not automation_is_deleted(automation):
+        automation.stop_requested = True
+        automation.status = AutomationStatus.stopping
+        automation.next_run_at = None
+        automation.error_message = "当前轮次已暂停；继续该任务后自动采集将恢复"
+    db.commit()
+    removed = remove_queued_import_calls(job.id)
+    message = "正在完成当前单篇，随后暂停" if state == PAUSE_REQUESTED else "任务已暂停"
+    if removed:
+        message += f"；已从队列移除 {removed} 个待执行调用"
+    return JobControlRead(job_id=job.id, state=control.state, deleted=control.deleted, message=message)
+
+
+@router.post("/jobs/{job_id}/resume", response_model=JobControlRead)
+def resume_job(job_id: str, background_tasks: BackgroundTasks, db: Db) -> JobControlRead:
+    job = get_job_or_404(db, job_id)
+    control = get_job_control(db, job.id)
+    if control is None or control.state != PAUSED:
+        if control and control.state == PAUSE_REQUESTED:
+            raise HTTPException(409, "任务正在到达安全暂停点，请稍后再继续")
+        raise HTTPException(409, "该任务没有处于已暂停状态")
+    clear_job_control(db, job)
+    job.status = JobStatus.queued
+    job.stage = "已继续，等待 Worker"
+    job.error_message = None
+    counts = dict(job.counts or {})
+    counts["execution_state"] = "queued"
+    job.counts = counts
+    append_job_log(job, "resumed", "用户继续任务，已重新进入后台队列")
+    automation = db.scalar(select(LiteratureAutomation).where(LiteratureAutomation.last_job_id == job.id))
+    if automation and not automation_is_deleted(automation):
+        automation.stop_requested = False
+        automation.status = AutomationStatus.running
+        automation.error_message = None
+        automation.next_run_at = None
+    db.commit()
+    remove_queued_import_calls(job.id)
+    if automation and not automation_is_deleted(automation):
+        try:
+            automation.rq_job_id = enqueue_automation_resume_cycle(automation.id)
+            db.commit()
+        except Exception as exc:
+            request_job_control(db, job, PAUSED)
+            counts = dict(job.counts or {})
+            counts["execution_state"] = "paused"
+            job.counts = counts
+            job.stage = "继续失败，任务仍保持暂停"
+            automation.stop_requested = True
+            automation.status = AutomationStatus.stopped
+            automation.error_message = f"{type(exc).__name__}: 无法连接 Redis/RQ"
+            db.commit()
+            raise HTTPException(502, automation.error_message) from exc
+    elif not enqueue_import(job.id, high_priority=is_priority_job(job)):
+        background_tasks.add_task(run_import_job, job.id)
+    return JobControlRead(job_id=job.id, state="active", deleted=False, message="任务已继续")
+
+
+@router.delete("/jobs/{job_id}", response_model=JobControlRead)
+def delete_job(job_id: str, db: Db) -> JobControlRead:
+    job = get_job_or_404(db, job_id)
+    execution_state = str((job.counts or {}).get("execution_state") or "queued")
+    control = request_job_control(db, job, CANCEL_REQUESTED, deleted=True)
+    counts = dict(job.counts or {})
+    counts["execution_state"] = "cancelling" if execution_state == "running" else "cancel_requested"
+    job.counts = counts
+    job.stage = "正在完成当前单篇后删除任务" if execution_state == "running" else "正在取消并删除任务"
+    append_job_log(job, "cancel_requested", "用户删除任务；已经入库的文献和知识不会删除")
+
+    automation = db.scalar(select(LiteratureAutomation).where(LiteratureAutomation.last_job_id == job.id))
+    if automation and not automation_is_deleted(automation):
+        automation.stop_requested = True
+        automation.status = AutomationStatus.stopping if execution_state == "running" else AutomationStatus.stopped
+        automation.next_run_at = None
+        automation.error_message = "当前轮次由用户删除，自动采集已停止"
+    db.commit()
+    remove_queued_import_calls(job.id)
+    if execution_state != "running":
+        apply_control_checkpoint(db, job)
+    return JobControlRead(
+        job_id=job.id,
+        state=control.state,
+        deleted=True,
+        message="任务已从列表移除；已入库文献和知识继续保留",
+    )
 
 
 @router.get("/jobs/{job_id}/candidates", response_model=list[CandidateRead])
 def get_candidates(job_id: str, db: Db, new_only: bool = False) -> list[CandidateRead]:
-    get_or_404(db, ImportJob, job_id)
+    get_job_or_404(db, job_id)
     return [candidate_to_schema(item) for item in candidates_for_job(db, job_id, new_only=new_only)]
 
 
@@ -353,7 +483,7 @@ def select_candidates(
     background_tasks: BackgroundTasks,
     db: Db,
 ) -> ImportJob:
-    job = get_or_404(db, ImportJob, job_id)
+    job = get_job_or_404(db, job_id)
     if job.status != JobStatus.awaiting_selection:
         raise HTTPException(409, f"任务当前状态 {job.status.value}，不能选择")
     if payload.requested_count == 0:
@@ -415,31 +545,44 @@ def list_automations(db: Db, knowledge_base_id: str | None = None) -> list[Liter
     statement = select(LiteratureAutomation)
     if knowledge_base_id:
         statement = statement.where(LiteratureAutomation.knowledge_base_id == knowledge_base_id)
-    return list(db.scalars(statement.order_by(LiteratureAutomation.created_at.desc()).limit(200)))
+    rows = list(db.scalars(statement.order_by(LiteratureAutomation.created_at.desc()).limit(500)))
+    return [item for item in rows if not automation_is_deleted(item)][:200]
 
 
 @router.get("/automations/{automation_id}", response_model=AutomationRead)
 def get_automation(automation_id: str, db: Db) -> LiteratureAutomation:
-    return get_or_404(db, LiteratureAutomation, automation_id)
+    automation = get_or_404(db, LiteratureAutomation, automation_id)
+    if automation_is_deleted(automation):
+        raise HTTPException(404, "LiteratureAutomation 不存在或已删除")
+    return automation
 
 
 @router.post("/automations/{automation_id}/stop", response_model=AutomationRead)
 def stop_automation(automation_id: str, db: Db) -> LiteratureAutomation:
-    automation = get_or_404(db, LiteratureAutomation, automation_id)
+    automation = get_automation(automation_id, db)
     automation.stop_requested = True
     if automation.status == AutomationStatus.running:
         automation.status = AutomationStatus.stopping
     else:
         automation.status = AutomationStatus.stopped
         automation.next_run_at = None
+    if automation.last_job_id:
+        last_job = db.get(ImportJob, automation.last_job_id)
+        if last_job and last_job.status not in {JobStatus.completed, JobStatus.failed}:
+            execution_state = str((last_job.counts or {}).get("execution_state") or "queued")
+            request_job_control(db, last_job, CANCEL_REQUESTED)
+            append_job_log(last_job, "stop_requested", "持续采集已停止；当前单篇完成后结束本轮")
+            if execution_state != "running":
+                apply_control_checkpoint(db, last_job)
     db.commit()
+    remove_queued_automation_calls(automation.id)
     db.refresh(automation)
     return automation
 
 
 @router.post("/automations/{automation_id}/restart", response_model=AutomationRead)
 def restart_automation(automation_id: str, db: Db) -> LiteratureAutomation:
-    automation = get_or_404(db, LiteratureAutomation, automation_id)
+    automation = get_automation(automation_id, db)
     if automation.status in {AutomationStatus.active, AutomationStatus.running, AutomationStatus.stopping}:
         raise HTTPException(409, "该自动任务已经在运行或等待运行")
     automation.stop_requested = False
@@ -457,6 +600,27 @@ def restart_automation(automation_id: str, db: Db) -> LiteratureAutomation:
     db.commit()
     db.refresh(automation)
     return automation
+
+
+@router.delete("/automations/{automation_id}", status_code=204)
+def delete_automation(automation_id: str, db: Db) -> Response:
+    automation = get_automation(automation_id, db)
+    running = automation.status == AutomationStatus.running
+    automation.stop_requested = True
+    automation.status = AutomationStatus.stopping if running else AutomationStatus.stopped
+    automation.next_run_at = None
+    mark_automation_deleted(automation)
+    if automation.last_job_id:
+        last_job = db.get(ImportJob, automation.last_job_id)
+        if last_job and last_job.status not in {JobStatus.completed, JobStatus.failed}:
+            execution_state = str((last_job.counts or {}).get("execution_state") or "queued")
+            request_job_control(db, last_job, CANCEL_REQUESTED, deleted=True)
+            append_job_log(last_job, "cancel_requested", "所属持续采集任务已删除；已入库文献保留")
+            if execution_state != "running":
+                apply_control_checkpoint(db, last_job)
+    db.commit()
+    remove_queued_automation_calls(automation.id)
+    return Response(status_code=204)
 
 
 @router.get("/knowledge-bases/{knowledge_base_id}/documents", response_model=list[DocumentRead])

@@ -143,6 +143,11 @@ def render_current_document_progress(job: dict[str, Any]) -> None:
     state_labels = {
         "running": "正在执行",
         "queued": "排队中",
+        "pausing": "正在安全暂停",
+        "paused": "已暂停",
+        "cancelling": "正在安全取消",
+        "cancel_requested": "等待取消",
+        "cancelled": "已取消",
         "completed": "已完成",
         "failed": "失败",
         "legacy": "旧任务/等待恢复",
@@ -224,12 +229,67 @@ def render_job(
             st.rerun()
 
 
+def render_job_controls(job: dict[str, Any], *, key_prefix: str) -> None:
+    """Render cooperative task controls without deleting imported knowledge."""
+
+    job_id = job["id"]
+    control_state = job.get("control_state") or "active"
+    status = job.get("status")
+    controls = st.columns([1, 1, 1.3, 1.2, 4])
+    if status not in {"completed", "failed", "awaiting_selection"}:
+        if control_state == "paused":
+            if controls[0].button("继续任务", key=f"{key_prefix}-resume-{job_id}", use_container_width=True):
+                try:
+                    result = api("POST", f"/jobs/{job_id}/resume")
+                    st.session_state.processing_notice = result.get("message") or "任务已继续"
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+        elif control_state == "pause_requested":
+            controls[0].button(
+                "暂停中…",
+                key=f"{key_prefix}-pausing-{job_id}",
+                disabled=True,
+                use_container_width=True,
+            )
+        else:
+            if controls[0].button("暂停", key=f"{key_prefix}-pause-{job_id}", use_container_width=True):
+                try:
+                    result = api("POST", f"/jobs/{job_id}/pause")
+                    st.session_state.processing_notice = result.get("message") or "暂停请求已提交"
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+    else:
+        controls[0].caption("任务已结束")
+    controls[1].button("刷新", key=f"{key_prefix}-refresh-{job_id}", use_container_width=True)
+    confirmed = controls[2].checkbox("确认删除", key=f"{key_prefix}-confirm-delete-{job_id}")
+    if controls[3].button(
+        "删除任务",
+        key=f"{key_prefix}-delete-{job_id}",
+        disabled=not confirmed,
+        use_container_width=True,
+    ):
+        try:
+            result = api("DELETE", f"/jobs/{job_id}")
+            st.session_state.processing_notice = (
+                result.get("message") or "任务已删除；已入库文献和知识继续保留"
+            )
+            st.rerun()
+        except RuntimeError as exc:
+            st.error(str(exc))
+    controls[4].caption("暂停/删除在当前单篇安全点生效；已经入库的文献、切片、事实和图谱不会删除。")
+
+
 @st.fragment(run_every=5)
 def render_processing_center(knowledge_base_id: str) -> None:
     heading, refresh = st.columns([5, 1])
     heading.subheader("后台文献处理中心")
     if refresh.button("立即刷新", key=f"processing-refresh-{knowledge_base_id}", use_container_width=True):
         st.rerun(scope="fragment")
+    notice = st.session_state.pop("processing_notice", None)
+    if notice:
+        st.success(notice)
     try:
         jobs = api("GET", f"/knowledge-bases/{knowledge_base_id}/jobs?limit=100")
     except RuntimeError as exc:
@@ -264,25 +324,30 @@ def render_processing_center(knowledge_base_id: str) -> None:
                 job_data=job,
                 show_logs=False,
             )
+            render_job_controls(job, key_prefix=f"processing-running-controls-{index}")
 
     if queued:
         with st.expander(f"排队或等待恢复的任务（{len(queued)}）", expanded=not running):
-            for job in queued[:50]:
+            for index, job in enumerate(queued[:50], 1):
                 counts = job.get("counts") or {}
                 queue_name = counts.get("worker_queue") or "等待 Worker 识别"
                 selected = int(counts.get("selected") or job.get("requested_count") or 0)
-                st.write(
-                    f"- **{job.get('query') or '文献任务'}** · {job.get('stage')} · "
-                    f"{selected} 篇 · `{queue_name}`"
-                )
+                with st.container(border=True):
+                    st.write(
+                        f"**{job.get('query') or '文献任务'}** · {job.get('stage')} · "
+                        f"{selected} 篇 · `{queue_name}`"
+                    )
+                    render_job_controls(job, key_prefix=f"processing-queued-{index}")
     if awaiting:
         with st.expander(f"等待你确认候选（{len(awaiting)}）"):
-            for job in awaiting[:30]:
+            for index, job in enumerate(awaiting[:30], 1):
                 counts = job.get("counts") or {}
-                st.write(
-                    f"- **{job.get('query')}** · 新候选 {counts.get('new', 0)} 篇 · "
-                    f"已有 {counts.get('existing', 0)} 篇"
-                )
+                with st.container(border=True):
+                    st.write(
+                        f"**{job.get('query')}** · 新候选 {counts.get('new', 0)} 篇 · "
+                        f"已有 {counts.get('existing', 0)} 篇"
+                    )
+                    render_job_controls(job, key_prefix=f"processing-awaiting-{index}")
     if recent_completed:
         with st.expander("最近完成或失败的任务"):
             for job in recent_completed:
@@ -590,7 +655,7 @@ def render_manual_discovery(conversation_id: str) -> None:
 
 
 def render_automations(conversation: dict[str, Any]) -> None:
-    st.caption("每轮自动扩词、检索、查重并处理 50～200 篇；任务通过 Redis/RQ 定时运行，关闭页面也不会停止。点击停止后完成当前单篇安全点，不再安排下一轮。")
+    st.caption("每轮自动扩词、检索、查重并处理 50～200 篇；任务通过 Redis/RQ 定时运行，关闭页面也不会停止。停止会在当前单篇安全点结束；删除任务不会删除已经入库的文献和知识。")
     with st.form("automation-create"):
         query = st.text_input("持续监测主题", placeholder="thin-film composite nanofiltration antifouling")
         cols = st.columns(3)
@@ -637,7 +702,7 @@ def render_automations(conversation: dict[str, Any]) -> None:
                 f"每轮 {task['batch_size']} 篇 · 间隔 {task['interval_minutes']} 分钟 · "
                 f"下次：{task.get('next_run_at') or '正在运行/等待调度'}"
             )
-            b1, b2, _ = st.columns([1, 1, 5])
+            b1, b2, b3, b4, _ = st.columns([1, 1, 1.3, 1.2, 4])
             if task["status"] in {"active", "running", "stopping"}:
                 if b1.button("停止", key=f"stop-{task['id']}"):
                     try:
@@ -654,6 +719,19 @@ def render_automations(conversation: dict[str, Any]) -> None:
                         st.error(str(exc))
             if b2.button("刷新", key=f"auto-refresh-{task['id']}"):
                 st.rerun()
+            confirmed = b3.checkbox("确认删除", key=f"auto-confirm-delete-{task['id']}")
+            if b4.button(
+                "删除任务",
+                key=f"auto-delete-{task['id']}",
+                disabled=not confirmed,
+                use_container_width=True,
+            ):
+                try:
+                    api("DELETE", f"/automations/{task['id']}")
+                    st.success("持续采集任务已删除；已经入库的文献和知识继续保留。")
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
             if task.get("error_message"):
                 st.warning(task["error_message"])
             if task.get("last_job_id"):

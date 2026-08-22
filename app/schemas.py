@@ -142,8 +142,17 @@ class JobRead(ORMModel):
     counts: dict[str, Any]
     log: list[dict[str, Any]]
     error_message: str | None
+    control_state: str = "active"
+    deleted: bool = False
     created_at: datetime
     updated_at: datetime
+
+
+class JobControlRead(BaseModel):
+    job_id: str
+    state: str
+    deleted: bool
+    message: str
 
 
 class UploadResponse(BaseModel):

@@ -6,12 +6,15 @@ from redis import Redis
 from rq import Queue, Worker
 
 from app.config import get_settings
-from app.db import engine
+from app.db import engine, init_db
 from app.services.recovery import recover_interrupted_tasks
 
 
 def main() -> None:
     settings = get_settings()
+    # The API normally creates backward-compatible tables first, but Workers may
+    # start at nearly the same time after a Compose upgrade.
+    init_db()
     connection = Redis.from_url(settings.redis_url)
     queue_names = [
         item.strip()

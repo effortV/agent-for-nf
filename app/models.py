@@ -237,6 +237,43 @@ class ImportJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    task_control: Mapped[TaskControl | None] = relationship(
+        back_populates="job",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
+    )
+
+    @property
+    def control_state(self) -> str:
+        return self.task_control.state if self.task_control else "active"
+
+    @property
+    def deleted(self) -> bool:
+        return bool(self.task_control and self.task_control.deleted)
+
+
+class TaskControl(Base):
+    """Durable cooperative control for a literature import job.
+
+    A separate row avoids losing pause/cancel requests when a Worker concurrently
+    writes progress into ImportJob.counts. Creating this new table is backward
+    compatible with existing PostgreSQL and SQLite knowledge bases.
+    """
+
+    __tablename__ = "task_controls"
+
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("import_jobs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    state: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    deleted: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    job: Mapped[ImportJob] = relationship(back_populates="task_control")
+
 
 class DiscoveryCandidate(Base):
     __tablename__ = "discovery_candidates"

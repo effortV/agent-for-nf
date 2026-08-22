@@ -9,6 +9,7 @@ from app.models import AutomationStatus, ImportJob, JobStatus, LiteratureAutomat
 from app.services.discovery_service import DiscoveryService
 from app.services.import_service import create_documents_from_candidates
 from app.services.pipeline import append_job_log, run_import_job_async
+from app.services.task_control import automation_is_deleted
 
 
 def enqueue_automation_cycle(automation_id: str, *, delay_minutes: int = 0) -> str:
@@ -39,6 +40,24 @@ def enqueue_automation_cycle(automation_id: str, *, delay_minutes: int = 0) -> s
     return rq_job.id
 
 
+def enqueue_automation_resume_cycle(automation_id: str) -> str:
+    settings = get_settings()
+    if not settings.use_rq:
+        raise RuntimeError("持续自动采集需要 Redis/RQ；请使用完整 Docker 模式启动")
+    from redis import Redis
+    from rq import Queue
+
+    queue = Queue(settings.queue_name, connection=Redis.from_url(settings.redis_url))
+    rq_job = queue.enqueue(
+        "app.services.automation.resume_automation_cycle",
+        automation_id,
+        job_timeout="24h",
+        result_ttl=86400,
+        failure_ttl=604800,
+    )
+    return rq_job.id
+
+
 def _account_finished_job(automation: LiteratureAutomation, job: ImportJob | None) -> None:
     """Count an automation import exactly once, including after a worker restart."""
     if not job or job.status != JobStatus.completed:
@@ -53,7 +72,7 @@ def _account_finished_job(automation: LiteratureAutomation, job: ImportJob | Non
 
 def _finish_or_reschedule(db, automation: LiteratureAutomation) -> None:
     reached_limit = automation.max_total is not None and automation.imported_total >= automation.max_total
-    if automation.stop_requested or reached_limit:
+    if automation.stop_requested or automation_is_deleted(automation) or reached_limit:
         automation.status = AutomationStatus.stopped
         automation.next_run_at = None
         if reached_limit:
@@ -73,7 +92,12 @@ async def run_automation_cycle_async(automation_id: str) -> None:
     automation: LiteratureAutomation | None = None
     try:
         automation = db.get(LiteratureAutomation, automation_id)
-        if not automation or automation.stop_requested or automation.status == AutomationStatus.stopped:
+        if (
+            not automation
+            or automation.stop_requested
+            or automation_is_deleted(automation)
+            or automation.status == AutomationStatus.stopped
+        ):
             if automation:
                 automation.status = AutomationStatus.stopped
                 automation.next_run_at = None
@@ -104,6 +128,16 @@ async def run_automation_cycle_async(automation_id: str) -> None:
             year_to=None,
             include_citation_expansion=True,
         )
+        db.refresh(automation)
+        if automation.stop_requested or automation_is_deleted(automation):
+            job.status = JobStatus.completed
+            job.stage = "自动采集已由用户停止"
+            job.progress = 1.0
+            job.completed_at = datetime.now(timezone.utc)
+            append_job_log(job, "stopped", "检索完成后收到停止/删除请求，本轮未继续导入")
+            db.commit()
+            _finish_or_reschedule(db, automation)
+            return
         remaining = automation.batch_size
         if automation.max_total is not None:
             remaining = min(remaining, max(0, automation.max_total - automation.imported_total))
@@ -144,7 +178,7 @@ async def resume_automation_cycle_async(automation_id: str) -> None:
     db = SessionLocal()
     try:
         automation = db.get(LiteratureAutomation, automation_id)
-        if not automation:
+        if not automation or automation_is_deleted(automation):
             return
         if automation.stop_requested and not automation.last_job_id:
             automation.status = AutomationStatus.stopped

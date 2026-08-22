@@ -17,6 +17,15 @@ from app.services.fulltext import FullTextResolver, FullTextResult, FullTextUnav
 from app.services.graph_store import GraphStore
 from app.services.parser import DocumentParser, ParsedBlock, ParsedDocument, chunk_document
 from app.services.storage import ObjectStorage
+from app.services.task_control import (
+    ACTIVE,
+    CANCEL_REQUESTED,
+    CANCEL_STATES,
+    CANCELLED,
+    PAUSE_STATES,
+    PAUSED,
+    get_job_control,
+)
 from app.services.vector_store import VectorStore
 
 
@@ -103,6 +112,72 @@ def update_current_document(
     job.counts = counts
     job.stage = stage
     job.progress = min(0.99, 0.25 + 0.7 * ((position - 1 + document_progress) / max(1, total)))
+
+
+def apply_control_checkpoint(db: Session, job: ImportJob, *, allow_pause: bool = True) -> str:
+    """Apply a durable user request only between document transactions.
+
+    A running PDF is allowed to finish its current parse/extract/index transaction.
+    This keeps PostgreSQL, Neo4j and Chroma consistent while still stopping before
+    the next paper. The return value is active, paused or cancelled.
+    """
+
+    control = get_job_control(db, job.id)
+    if control is None:
+        return ACTIVE
+    if control.deleted and control.state not in CANCEL_STATES:
+        control.state = CANCEL_REQUESTED
+    if control.state in CANCEL_STATES:
+        was_terminal = control.state == CANCELLED
+        control.state = CANCELLED
+        counts = dict(job.counts or {})
+        counts["execution_state"] = "cancelled"
+        current = dict(counts.get("current_document") or {})
+        if current:
+            current.update(
+                {
+                    "state": "cancelled",
+                    "stage": "已在单篇安全点停止",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            counts["current_document"] = current
+        job.counts = counts
+        job.status = JobStatus.completed
+        job.stage = "已取消；已入库文献保留"
+        job.completed_at = datetime.now(timezone.utc)
+        if not was_terminal:
+            append_job_log(job, "cancelled", "用户取消任务；已完成入库的文献和知识保留")
+        db.commit()
+        return CANCELLED
+    if control.state in PAUSE_STATES:
+        if not allow_pause:
+            control.state = ACTIVE
+            db.commit()
+            return ACTIVE
+        was_paused = control.state == PAUSED
+        control.state = PAUSED
+        counts = dict(job.counts or {})
+        counts["execution_state"] = "paused"
+        current = dict(counts.get("current_document") or {})
+        if current:
+            current.update(
+                {
+                    "state": "paused",
+                    "stage": "已在单篇安全点暂停",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            counts["current_document"] = current
+        job.counts = counts
+        job.status = JobStatus.queued
+        job.stage = "已暂停；可继续任务"
+        job.completed_at = None
+        if not was_paused:
+            append_job_log(job, "paused", "任务已在单篇安全点暂停；已入库文献保留")
+        db.commit()
+        return PAUSED
+    return ACTIVE
 
 
 async def process_document(
@@ -457,6 +532,8 @@ async def run_import_job_async(job_id: str) -> None:
         job = db.get(ImportJob, job_id)
         if not job:
             return
+        if apply_control_checkpoint(db, job) != ACTIVE:
+            return
         counts = dict(job.counts or {})
         counts["execution_state"] = "running"
         try:
@@ -490,6 +567,10 @@ async def run_import_job_async(job_id: str) -> None:
         total = max(1, len(documents))
         successful = 0
         for index, document in enumerate(documents, 1):
+            db.expire_all()
+            job = db.get(ImportJob, job_id)
+            if not job or apply_control_checkpoint(db, job) != ACTIVE:
+                return
             db.refresh(document)
             if (document.metadata_json or {}).get("import_job_id") != job.id:
                 append_job_log(job, "reprioritized", f"文献已转交其他优先任务，当前批次跳过：{document.title}", document.id)
@@ -505,7 +586,14 @@ async def run_import_job_async(job_id: str) -> None:
             )
             db.commit()
             successful += int(await process_document(db, job, document, position=index, total=total))
+            db.expire_all()
+            job = db.get(ImportJob, job_id)
+            if not job or apply_control_checkpoint(db, job, allow_pause=index < len(documents)) != ACTIVE:
+                return
         db.expire_all()
+        job = db.get(ImportJob, job_id)
+        if not job or apply_control_checkpoint(db, job, allow_pause=False) != ACTIVE:
+            return
         all_documents = [
             item
             for item in db.scalars(select(Document).where(Document.knowledge_base_id == job.knowledge_base_id))
