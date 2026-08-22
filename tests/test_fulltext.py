@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from app.config import Settings
-from app.services.fulltext import FullTextResolver, _ROBOTS_CACHE
+from app.services.fulltext import ElsevierEntitlementError, FullTextResolver, _ROBOTS_CACHE
 from app.services.pipeline import content_mode_label, document_processing_priority, update_current_document
 
 
@@ -115,6 +115,68 @@ def test_private_network_urls_are_rejected() -> None:
             await resolver.close()
 
     asyncio.run(exercise())
+
+
+def test_elsevier_requests_explicit_full_view_and_accepts_body_xml() -> None:
+    async def exercise() -> None:
+        captured: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["view"] = request.url.params.get("view", "")
+            captured["accept"] = request.headers.get("accept", "")
+            captured["api_key"] = request.headers.get("x-els-apikey", "")
+            captured["resource_version"] = request.headers.get("x-els-resourceversion", "")
+            captured["insttoken"] = request.headers.get("x-els-insttoken", "")
+            body = ("Elsevier nanofiltration full text " * 40).encode()
+            content = b"<full-text-retrieval-response><originalText>" + body + b"</originalText></full-text-retrieval-response>"
+            return httpx.Response(200, request=request, content=content, headers={"content-type": "text/xml"})
+
+        resolver = FullTextResolver(Settings(elsevier_api_key="key-test", elsevier_insttoken="inst-test"))
+        await resolver.client.aclose()
+        resolver.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await resolver._from_elsevier("10.1000/nf.1")
+            assert result is not None
+            assert result.source == "sciencedirect-tdm"
+            assert captured == {
+                "view": "FULL",
+                "accept": "text/xml",
+                "api_key": "key-test",
+                "resource_version": "new",
+                "insttoken": "inst-test",
+            }
+        finally:
+            await resolver.close()
+
+    asyncio.run(exercise())
+
+
+def test_elsevier_meta_abs_is_not_mislabeled_as_fulltext() -> None:
+    async def exercise() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            content = b"<full-text-retrieval-response><coredata><description>Abstract only</description></coredata></full-text-retrieval-response>"
+            return httpx.Response(200, request=request, content=content, headers={"content-type": "text/xml"})
+
+        resolver = FullTextResolver(Settings(elsevier_api_key="key-test"))
+        await resolver.client.aclose()
+        resolver.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(ElsevierEntitlementError, match="META_ABS"):
+                await resolver._from_elsevier("10.1000/nf.1")
+        finally:
+            await resolver.close()
+
+    asyncio.run(exercise())
+
+
+def test_elsevier_pii_is_extracted_from_sciencedirect_urls() -> None:
+    assert (
+        FullTextResolver.extract_elsevier_pii(
+            "https://www.sciencedirect.com/science/article/pii/S0376738825001234"
+        )
+        == "S0376738825001234"
+    )
+    assert FullTextResolver.extract_elsevier_pii("https://example.org/article") is None
 
 
 def test_saved_or_public_fulltext_is_processed_before_metadata_only_candidates() -> None:

@@ -62,6 +62,7 @@ def test_connector_auth_headers_are_added() -> None:
         headers = discovery._elsevier_headers("application/json")
         assert headers["X-ELS-APIKey"] == "elsevier-test"
         assert headers["X-ELS-Insttoken"] == "institution-test"
+        assert headers["X-ELS-ResourceVersion"] == "new"
     finally:
         asyncio.run(discovery.close())
 
@@ -74,6 +75,42 @@ def test_safe_error_never_contains_query_secrets() -> None:
     assert safe["status_code"] == 401
     assert "secret-value" not in json.dumps(safe)
     assert "?" not in safe["endpoint"]
+
+
+def test_elsevier_search_builds_public_pii_landing_url() -> None:
+    async def exercise() -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "search-results": {
+                        "entry": [
+                            {
+                                "dc:title": "Nanofiltration membrane",
+                                "dc:identifier": "SCIDIR:S0376738825001234",
+                                "prism:doi": "10.1016/j.memsci.2025.123456",
+                                "prism:coverDate": "2025-05-01",
+                            }
+                        ]
+                    }
+                },
+            )
+
+        discovery = LiteratureDiscovery(Settings(elsevier_api_key="elsevier-test"))
+        await discovery.client.aclose()
+        discovery.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        discovery._source_limits["elsevier"] = (asyncio.Semaphore(1), 0.0)
+        try:
+            rows = await discovery._search_elsevier("nanofiltration", 1, None, None)
+            assert rows[0].landing_url == (
+                "https://www.sciencedirect.com/science/article/pii/S0376738825001234"
+            )
+            assert rows[0].raw["elsevier_pii"] == "S0376738825001234"
+        finally:
+            await discovery.close()
+
+    asyncio.run(exercise())
 
 
 def test_transient_429_is_retried_and_auth_error_opens_circuit() -> None:

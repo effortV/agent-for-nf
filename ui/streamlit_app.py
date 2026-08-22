@@ -362,8 +362,16 @@ def render_connector_status(connector_status: dict[str, Any]) -> None:
         http_code = errors[0].get("status_code") if errors else None
         if state not in {"error", "degraded", "not_configured"}:
             continue
-        if name == "elsevier" and http_code in {401, 403}:
-            st.warning("Elsevier 返回 401/403：API Key 已读取，但当前 Key 或机构授权无效。系统已熔断本轮 Elsevier 请求，其他渠道继续工作；可补充 ELSEVIER_INSTTOKEN 后重试。")
+        if name == "elsevier" and http_code == 401:
+            st.warning(
+                "Elsevier 返回 HTTP 401：Key 无效、已停用，或尚未启用当前 API。"
+                "请在 Developer Portal 检查应用；系统不会使用或保存学校账号密码。"
+            )
+        elif name == "elsevier" and http_code == 403:
+            st.warning(
+                "Elsevier 返回 HTTP 403：API Key 已被识别，但当前服务器公网 IP/Insttoken "
+                "没有相应订阅全文权限。请从学校订阅网络运行，或向 Elsevier 申请官方 ELSEVIER_INSTTOKEN。"
+            )
         elif http_code == 429:
             st.warning(f"{name} 返回 HTTP 429。系统已按该渠道限速和自动重试，本次结果可能仍不完整；稍后重试即可。")
         elif state == "error":

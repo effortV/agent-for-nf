@@ -170,6 +170,7 @@ class LiteratureDiscovery:
             return {"Accept": accept}
         headers = {
             "X-ELS-APIKey": self.settings.elsevier_api_key.get_secret_value(),
+            "X-ELS-ResourceVersion": "new",
             "Accept": accept,
         }
         if self.settings.elsevier_insttoken:
@@ -481,6 +482,20 @@ class LiteratureDiscovery:
         for item in response.json().get("search-results", {}).get("entry", []):
             title = item.get("dc:title") or ""
             creator = item.get("dc:creator") or ""
+            identifier = str(item.get("dc:identifier") or "")
+            pii = str(item.get("pii") or "") or (
+                identifier.split(":", 1)[1]
+                if identifier.casefold().startswith(("scidir:", "pii:")) and ":" in identifier
+                else ""
+            )
+            landing_url = (
+                f"https://www.sciencedirect.com/science/article/pii/{pii}"
+                if pii
+                else item.get("prism:url")
+            )
+            raw = dict(item)
+            if pii:
+                raw["elsevier_pii"] = pii
             results.append(
                 LiteratureCandidate.create(
                     source="sciencedirect",
@@ -489,8 +504,8 @@ class LiteratureDiscovery:
                     doi=item.get("prism:doi"),
                     publication_year=int(item["prism:coverDate"][:4]) if item.get("prism:coverDate") else None,
                     venue=item.get("prism:publicationName"),
-                    landing_url=item.get("prism:url"),
-                    raw=item,
+                    landing_url=landing_url,
+                    raw=raw,
                 )
             )
         return [item for item in results if item.title]

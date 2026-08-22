@@ -10,6 +10,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import get_settings
+from app.services.fulltext import ElsevierAuthenticationError, ElsevierEntitlementError, FullTextResolver
 from app.services.literature import LiteratureDiscovery
 from app.services.llm import DeepSeekClient
 
@@ -42,9 +43,17 @@ async def main() -> None:
         if settings.elsevier_api_key:
             try:
                 rows = await discovery._search_elsevier("nanofiltration membrane", 1, None, None)
-                report["elsevier"] = {"ok": True, "result_count": len(rows)}
+                report["elsevier"] = {
+                    "api_key_valid": True,
+                    "metadata_search": {"ok": True, "result_count": len(rows)},
+                    "insttoken_configured": bool(settings.elsevier_insttoken),
+                }
             except Exception as exc:
-                report["elsevier"] = {"ok": False, "error": discovery._safe_error(exc)}
+                report["elsevier"] = {
+                    "api_key_valid": False,
+                    "metadata_search": {"ok": False, "error": discovery._safe_error(exc)},
+                    "insttoken_configured": bool(settings.elsevier_insttoken),
+                }
         else:
             report["elsevier"] = {"ok": False, "error": "ELSEVIER_API_KEY is missing"}
 
@@ -58,6 +67,38 @@ async def main() -> None:
             report["openalex"] = {"ok": False, "error": "OPENALEX_API_KEY is missing"}
     finally:
         await discovery.close()
+
+    if settings.elsevier_api_key and isinstance(report.get("elsevier"), dict):
+        elsevier_report = report["elsevier"]
+        assert isinstance(elsevier_report, dict)
+        resolver = FullTextResolver(settings)
+        try:
+            # DOI used in Elsevier's own TDM guide. This distinguishes a valid
+            # metadata key from FULL-view institutional entitlement.
+            result = await resolver._from_elsevier("10.1016/j.ibusrev.2010.09.002")
+            elsevier_report["fulltext_tdm"] = {
+                "ok": result is not None,
+                "content_mode": "FULL XML" if result else "not_found",
+            }
+        except ElsevierAuthenticationError as exc:
+            elsevier_report["fulltext_tdm"] = {
+                "ok": False,
+                "reason": "api_key_authentication",
+                "message": str(exc),
+            }
+        except ElsevierEntitlementError as exc:
+            elsevier_report["fulltext_tdm"] = {
+                "ok": False,
+                "reason": "institutional_entitlement",
+                "message": str(exc),
+            }
+        except Exception as exc:
+            elsevier_report["fulltext_tdm"] = {
+                "ok": False,
+                "reason": type(exc).__name__,
+            }
+        finally:
+            await resolver.close()
 
     if settings.unpaywall_email:
         async with httpx.AsyncClient(timeout=20) as client:

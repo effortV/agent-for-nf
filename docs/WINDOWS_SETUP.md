@@ -59,14 +59,30 @@ powershell -ExecutionPolicy Bypass -File scripts\stop_backend.ps1
 
 ## Elsevier insttoken 获取方式
 
-Elsevier 默认根据请求来源的机构 IP 判断 ScienceDirect 订阅权限。API key 能通过开发者身份认证，但不保证具备订阅全文权限。如果在家庭网络、校外网络或学校代理后面调用失败：
+Elsevier TDM 分成两层权限：
+
+- `ELSEVIER_API_KEY` 标识开发者应用，可用于 ScienceDirect 元数据检索，但不自动继承学校订阅。
+- Article Retrieval API 的 `view=FULL` 正文权限由**发起 API 请求的服务器公网 IP**或 Elsevier 官方签发的 `Insttoken` 决定。没有全文权限时，默认响应可能只是 `META_ABS` 摘要 XML；本项目会强制请求 `FULL` 并校验正文，不再把摘要 XML 误标成全文。
+
+系统使用官方新版搜索端点 `/content/search/sciencedirect`，按 DOI 或 PII 使用 `/content/article/{doi|pii}/...` 获取 `text/xml` 全文，并在服务端请求头发送 `X-ELS-APIKey` 与可选的 `X-ELS-Insttoken`。
+
+学校统一身份认证账号、VPN 网页账号或 ScienceDirect 网页密码都不是 TDM API 凭据。不要把账号密码交给程序；本项目不会保存密码、模拟登录、抓取 Cookie 或绕过付费墙。如果在家庭网络、校外网络、仅浏览器代理或外部服务器上调用失败：
 
 1. 登录 Elsevier Developer Portal，确认 API key 已启用 ScienceDirect API。
-2. 联系学校图书馆电子资源/API 管理员，确认学校订阅允许该 TDM 用途。
-3. 通过 Elsevier Research Products APIs Support Center 提交申请，说明机构名称、API key 对应应用、ScienceDirect TDM 用途、部署网络位置及所需内容范围，请求 `Institutional Token`。
-4. Elsevier 批准后会提供与 API key 配套的 insttoken。运行 `scripts\configure_env.ps1 -KeepExisting`，把它保存到 `ELSEVIER_INSTTOKEN`。
+2. 优先让 Docker/服务器运行在学校认可的出口 IP 下。仅浏览器生效的 WebVPN 通常不能改变后台 Docker 请求的出口 IP。
+3. 联系学校图书馆电子资源/API 管理员，确认学校订阅合同允许该 TDM 用途。
+4. 通过 Elsevier Research Products APIs Support Center 提交申请，说明机构名称、API key 对应应用、ScienceDirect TDM 用途、部署网络位置及所需内容范围，请求 `Institutional Token`。
+5. Elsevier 批准后会提供与 API key 配套的 insttoken。运行 `scripts\configure_env.ps1 -KeepExisting`，把它保存到 `ELSEVIER_INSTTOKEN`。
 
-官方说明：<https://dev.elsevier.com/tecdoc_api_authentication.html>。insttoken 代表机构订阅权限，只能保存在服务器端 `.env`，不能放入浏览器代码、仓库或 URL。
+配置后可执行：
+
+```bat
+conda run -n nf-agent python -m scripts.check_external_apis
+```
+
+报告会分别显示 `metadata_search`（Key 是否可用）与 `fulltext_tdm`（当前 IP/Insttoken 是否具备 FULL 权限），不会打印密钥。
+
+官方说明：<https://dev.elsevier.com/tecdoc_text_mining.html>、<https://dev.elsevier.com/tecdoc_api_authentication.html>。insttoken 代表机构订阅权限，只能保存在服务器端 `.env`，不能放入浏览器代码、仓库或 URL。
 
 ## 5. 在 Anaconda Prompt 启动 Streamlit
 

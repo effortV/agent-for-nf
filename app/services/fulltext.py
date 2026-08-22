@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import quote, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
+from xml.etree import ElementTree as ET
 
 import httpx
 from bs4 import BeautifulSoup
@@ -19,6 +20,14 @@ from app.services.dedupe import extract_doi, normalize_doi, sha256_bytes
 
 class FullTextUnavailable(RuntimeError):
     pass
+
+
+class ElsevierAuthenticationError(ValueError):
+    """The API key is missing, invalid, disabled, or not enabled for this API."""
+
+
+class ElsevierEntitlementError(ValueError):
+    """The API key is valid but the caller is not entitled to the requested FULL view."""
 
 
 @dataclass(slots=True)
@@ -131,9 +140,13 @@ class FullTextResolver:
             except (httpx.HTTPError, ValueError) as exc:
                 errors.append(self._safe_error("Unpaywall", exc))
 
-        if normalized_doi and self.settings.elsevier_api_key:
+        elsevier_pii = self.extract_elsevier_pii(hinted_url, landing_url)
+        if (normalized_doi or elsevier_pii) and self.settings.elsevier_api_key:
             try:
-                result = await self._from_elsevier(normalized_doi)
+                if normalized_doi:
+                    result = await self._from_elsevier(normalized_doi, identifier_type="doi")
+                else:
+                    result = await self._from_elsevier(elsevier_pii or "", identifier_type="pii")
                 if result:
                     return result
             except (httpx.HTTPError, ValueError) as exc:
@@ -245,33 +258,106 @@ class FullTextResolver:
                 continue
         return None
 
-    async def _from_elsevier(self, doi: str) -> FullTextResult | None:
+    async def _from_elsevier(
+        self,
+        identifier: str,
+        *,
+        identifier_type: str = "doi",
+    ) -> FullTextResult | None:
         api_key = self.settings.elsevier_api_key
         if not api_key:
             return None
-        url = f"https://api.elsevier.com/content/article/doi/{quote(doi, safe='')}"
-        headers = {"X-ELS-APIKey": api_key.get_secret_value(), "Accept": "application/xml"}
+        if identifier_type not in {"doi", "pii"}:
+            raise ValueError("Elsevier 文献标识类型必须是 DOI 或 PII")
+        value = identifier.strip()
+        if not value:
+            return None
+        url = f"https://api.elsevier.com/content/article/{identifier_type}/{quote(value, safe='')}"
+        headers = {
+            "X-ELS-APIKey": api_key.get_secret_value(),
+            "X-ELS-ResourceVersion": "new",
+            "Accept": "text/xml",
+        }
         if self.settings.elsevier_insttoken:
             headers["X-ELS-Insttoken"] = self.settings.elsevier_insttoken.get_secret_value()
-        response = await self.client.get(url, headers=headers)
+        # FULL is deliberate. Without it Elsevier may return META_ABS XML for an
+        # unentitled caller, which must never be saved and labelled as full text.
+        response = await self.client.get(url, params={"view": "FULL"}, headers=headers)
         if response.status_code == 404:
             return None
-        if response.status_code in {401, 403}:
-            raise ValueError(f"HTTP {response.status_code}，API Key/机构 TDM 授权不可用")
+        if response.status_code == 401:
+            raise ElsevierAuthenticationError(
+                "HTTP 401：Elsevier API Key 无效、已停用，或未启用 Article Retrieval API"
+            )
+        if response.status_code == 403:
+            raise ElsevierEntitlementError(
+                "HTTP 403：API Key 已被识别，但当前服务器 IP/Insttoken 没有该文献的 ScienceDirect FULL 权限"
+            )
+        if response.status_code == 429:
+            raise ValueError("HTTP 429：Elsevier API 配额或速率限制，请稍后重试")
         response.raise_for_status()
         content = response.content
         if not content.lstrip().startswith(b"<"):
             raise ValueError("ScienceDirect 返回内容不是 XML")
+        if not self.is_elsevier_fulltext_xml(content):
+            raise ElsevierEntitlementError(
+                "Elsevier 只返回了题录/摘要 XML（META_ABS），未返回 FULL 正文；"
+                "请从学校订阅 IP 发起请求或配置官方 Insttoken"
+            )
         return FullTextResult(
             content=content,
-            content_type="application/xml",
+            content_type="text/xml",
             extension="xml",
             source="sciencedirect-tdm",
             url=self._safe_url(str(response.url)),
             license=None,
             sha256=sha256_bytes(content),
-            doi=doi,
+            doi=value if identifier_type == "doi" else None,
         )
+
+    @staticmethod
+    def extract_elsevier_pii(*urls_or_identifiers: str | None) -> str | None:
+        """Extract a conservative Elsevier PII from a ScienceDirect/API URL."""
+        for value in urls_or_identifiers:
+            if not value:
+                continue
+            match = re.search(r"(?i)(?:/pii/|\b(?:pii|scidir):)([a-z0-9]{10,40})", value)
+            if match:
+                return match.group(1).upper()
+        return None
+
+    @staticmethod
+    def is_elsevier_fulltext_xml(content: bytes) -> bool:
+        """Reject META/META_ABS payloads that contain no article body."""
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError as exc:
+            raise ValueError("ScienceDirect 返回的 XML 无法解析") from exc
+
+        def local_name(tag: object) -> str:
+            return str(tag).rsplit("}", 1)[-1].casefold()
+
+        strong_body_tags = {"originaltext", "body", "sections"}
+        article_tags = {"article", "doc"}
+        section_tags = {"section", "sec"}
+        article_nodes = []
+        has_section = False
+        for element in root.iter():
+            name = local_name(element.tag)
+            if name in strong_body_tags:
+                body_text = " ".join(part.strip() for part in element.itertext() if part.strip())
+                if len(body_text) >= 500:
+                    return True
+            if name in article_tags:
+                article_nodes.append(element)
+            elif name in section_tags:
+                has_section = True
+        if has_section:
+            for element in article_nodes:
+                article_text = " ".join(part.strip() for part in element.itertext() if part.strip())
+                if len(article_text) >= 1000:
+                    return True
+        return False
 
     async def _from_public_page(
         self,
