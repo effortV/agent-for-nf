@@ -38,6 +38,9 @@ echo "Stopping NF-Atlas on this server..."
 for volume in nf_postgres nf_neo4j_data nf_minio nf_chroma; do
   docker volume create "nf-atlas_${volume}" >/dev/null
 done
+if [[ -f "${SNAPSHOT}/models.tar.gz" ]]; then
+  docker volume create nf-atlas_nf_models >/dev/null
+fi
 
 restore_archive() {
   local volume="$1"
@@ -53,6 +56,10 @@ echo "Restoring Neo4j, Chroma and MinIO volumes..."
 restore_archive nf-atlas_nf_neo4j_data neo4j-data.tar.gz
 restore_archive nf-atlas_nf_chroma chroma.tar.gz
 restore_archive nf-atlas_nf_minio minio.tar.gz
+if [[ -f "${SNAPSHOT}/models.tar.gz" ]]; then
+  echo "Restoring the optional embedding-model cache..."
+  restore_archive nf-atlas_nf_models models.tar.gz
+fi
 
 echo "Starting PostgreSQL and restoring the logical dump..."
 "${COMPOSE[@]}" up -d postgres
