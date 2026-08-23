@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ORMModel(BaseModel):
@@ -121,12 +121,22 @@ class ImportSelectionRequest(BaseModel):
     candidate_ids: list[str] = Field(default_factory=list, max_length=200)
     requested_count: int = Field(default=0, ge=0, le=200)
 
+    @field_validator("candidate_ids", mode="before")
+    @classmethod
+    def deduplicate_candidate_ids(cls, value: Any) -> Any:
+        if not isinstance(value, (list, tuple)):
+            return value
+        unique: list[Any] = []
+        for candidate_id in value:
+            if candidate_id not in unique:
+                unique.append(candidate_id)
+        return unique
+
     @model_validator(mode="after")
     def selection_matches_count(self) -> ImportSelectionRequest:
-        if len(set(self.candidate_ids)) != len(self.candidate_ids):
-            raise ValueError("candidate_ids 不能重复")
-        if self.requested_count != len(self.candidate_ids):
-            raise ValueError("requested_count 必须等于 candidate_ids 数量；0 表示不新增")
+        # The server derives the billable/import count from unique IDs instead
+        # of rejecting a whole batch because a UI rerun repeated an option.
+        self.requested_count = len(self.candidate_ids)
         return self
 
 

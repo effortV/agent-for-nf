@@ -22,6 +22,8 @@ def create_documents_from_candidates(
     top_n: int | None = None,
 ) -> list[str]:
     """Create selected documents after rechecking uniqueness inside the transaction."""
+    if candidate_ids is not None:
+        candidate_ids = list(dict.fromkeys(candidate_ids))
     statement = select(DiscoveryCandidate).where(
         DiscoveryCandidate.job_id == job.id,
         DiscoveryCandidate.already_exists.is_(False),

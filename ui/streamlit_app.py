@@ -446,6 +446,7 @@ def render_discovery_results(state_key: str, *, default_count: int) -> None:
         max_selections=200,
         key=f"selection-{state_key}-{discovery['job_id']}",
     )
+    selected_ids = list(dict.fromkeys(selected_ids))
     st.caption(f"本次新增 {len(selected_ids)} 篇；数量只计算四级查重后的新文献。无合法全文时将用题名+摘要入库。")
     label = "确认并开始入库" if selected_ids else "确认新增 0 篇"
     if st.button(label, type="primary", key=f"confirm-{state_key}-{discovery['job_id']}"):
