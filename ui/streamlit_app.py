@@ -540,7 +540,7 @@ def render_chat_module(conversation: dict[str, Any]) -> None:
         st.caption("选择 0：不发现或新增文献，只使用现有知识库问答。")
     if st.session_state.get("active_job"):
         with st.expander("当前入库任务", expanded=False):
-            render_job(st.session_state.active_job, key_prefix="chat")
+            render_job(st.session_state.active_job, key_prefix="chat", embedded=True)
     if st.session_state.get("chat_discovery"):
         st.markdown("#### Agent 主动发现的候选")
         render_discovery_results("chat_discovery", default_count=int(st.session_state.get("chat_desired", desired)))
