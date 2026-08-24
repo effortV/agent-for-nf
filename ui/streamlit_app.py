@@ -139,7 +139,8 @@ def render_status() -> None:
         st.stop()
     cols = st.columns(5)
     cols[0].metric("后端", "在线")
-    cols[1].metric("DeepSeek-V3.2", "已配置" if health["llm_configured"] else "未配置")
+    chat_model = str(health.get("chat_llm_model") or "deepseek-ai/DeepSeek-V4-Pro").split("/")[-1]
+    cols[1].metric("对话模型", chat_model if health["llm_configured"] else "未配置")
     cols[2].metric("图谱", "Neo4j" if health["neo4j_configured"] else "SQL 回退")
     cols[3].metric("数据库", health["database"])
     cols[4].metric("后台任务", health["queue_mode"])
@@ -473,6 +474,17 @@ def render_messages(conversation_id: str) -> None:
     for message in messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message["role"] == "assistant" and message.get("model_name"):
+                model_call = next(
+                    (call for call in message.get("tool_calls", []) if call.get("tool") == "conversation_llm"),
+                    {},
+                )
+                thinking_label = (
+                    "深度思考：开启" if model_call.get("deep_thinking") else "深度思考：关闭"
+                    if model_call
+                    else ""
+                )
+                st.caption(" · ".join(item for item in (message["model_name"], thinking_label) if item))
             if message.get("evidence"):
                 with st.expander(f"查看 {len(message['evidence'])} 条检索证据"):
                     for item in message["evidence"]:
@@ -518,7 +530,7 @@ def render_chat_module(conversation: dict[str, Any]) -> None:
         "每次提问先扫描整个现有知识库（不是只看本轮新增文献），再用纳滤中英文词表联查 Neo4j、Chroma 和全文关键词；"
         "DeepSeek 负责跨文献比较、因果分析与可验证假设。只有最终送入模型的证据会按相关性和独立文献覆盖度压缩。"
     )
-    mode_col, literature_col, count_col = st.columns([1.3, 2, 1])
+    mode_col, thinking_col, literature_col, count_col = st.columns([1.3, 1.1, 2, 1])
     mode_label = mode_col.selectbox(
         "研究模式",
         ["深度科研（推荐）", "证据严格", "快速问答"],
@@ -529,6 +541,11 @@ def render_chat_module(conversation: dict[str, Any]) -> None:
         "证据严格": "evidence_strict",
         "快速问答": "rapid",
     }
+    deep_thinking = thinking_col.toggle(
+        "V4-Pro 深度思考",
+        value=True,
+        help="默认开启；关闭后仍使用 DeepSeek-V4-Pro，但不启用 enable_thinking，可降低等待时间和用量。",
+    )
     proactive = literature_col.toggle("证据不足或你要求找文献时，主动检索新文献", value=True)
     desired = count_col.number_input("预选新文献", min_value=0, max_value=200, value=50, step=10)
     knowledge_discovery = st.toggle(
@@ -560,6 +577,7 @@ def render_chat_module(conversation: dict[str, Any]) -> None:
                         "desired_new_count": int(desired),
                         "knowledge_discovery": knowledge_discovery,
                         "research_mode": mode_map[mode_label],
+                        "deep_thinking": deep_thinking,
                     },
                 )
                 if result.get("discovery"):

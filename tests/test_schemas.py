@@ -1,7 +1,13 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas import ImportSelectionRequest
+from app.schemas import ChatRequest, ImportSelectionRequest
+
+
+def test_chat_uses_deep_thinking_by_default() -> None:
+    payload = ChatRequest(conversation_id="conversation", question="question")
+
+    assert payload.deep_thinking is True
 
 
 def test_import_selection_deduplicates_ids_and_recalculates_count() -> None:

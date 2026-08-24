@@ -11,7 +11,6 @@ from app.models import Conversation, KnowledgeInsight
 from app.services.graph_store import GraphStore
 from app.services.llm import DeepSeekClient
 
-
 ALLOWED_INSIGHT_TYPES = {"pattern", "contradiction", "hypothesis"}
 
 
@@ -57,6 +56,7 @@ class KnowledgeDiscoveryEngine:
                 ),
                 user=json.dumps({"research_question": question, "evidence": indexed}, ensure_ascii=False),
                 max_tokens=6500,
+                enable_thinking=self.llm.enable_thinking,
             )
         except Exception:
             return []
@@ -85,7 +85,7 @@ class KnowledgeDiscoveryEngine:
                 knowledge_base_id=conversation.knowledge_base_id,
                 conversation_id=conversation.id,
                 question=question,
-                model_name=self.settings.llm_model,
+                model_name=self.llm.model_name,
                 **normalized,
             )
             self.db.add(row)

@@ -83,10 +83,15 @@ def question_terms(question: str) -> list[str]:
 
 
 class NanofiltrationRAGAgent:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, *, deep_thinking: bool = True):
         self.db = db
         self.settings = get_settings()
-        self.llm = DeepSeekClient(self.settings)
+        self.deep_thinking = deep_thinking
+        self.llm = DeepSeekClient(
+            self.settings,
+            model_name=self.settings.chat_llm_model,
+            enable_thinking=deep_thinking,
+        )
         self.graph_store = GraphStore(self.settings)
         self.vector_store = VectorStore(self.settings)
 
@@ -140,7 +145,13 @@ class NanofiltrationRAGAgent:
                     "conversation_id": conversation.id,
                     "enable_knowledge_discovery": enable_knowledge_discovery,
                     "research_mode": research_mode,
-                    "tool_calls": [],
+                    "tool_calls": [
+                        {
+                            "tool": "conversation_llm",
+                            "model": self.llm.model_name,
+                            "deep_thinking": self.deep_thinking,
+                        }
+                    ],
                 }
             )
         finally:
@@ -196,6 +207,7 @@ class NanofiltrationRAGAgent:
                     },
                 ],
                 max_tokens=1200,
+                enable_thinking=False,
             )
             conversation.rolling_summary = summary
             self.db.commit()
@@ -225,6 +237,7 @@ class NanofiltrationRAGAgent:
                     ensure_ascii=False,
                 ),
                 max_tokens=800,
+                enable_thinking=False,
             )
             if isinstance(result, dict):
                 standalone = str(result.get("standalone_question") or question).strip()[:2000]
@@ -256,6 +269,7 @@ class NanofiltrationRAGAgent:
                 ),
                 user=question,
                 max_tokens=300,
+                enable_thinking=False,
             )
             route = result.get("route") if isinstance(result, dict) else None
             if route in {"graph", "vector", "hybrid"}:
@@ -419,6 +433,7 @@ class NanofiltrationRAGAgent:
                         ensure_ascii=False,
                     ),
                     max_tokens=600,
+                    enable_thinking=False,
                 )
                 if isinstance(result, dict):
                     needs = bool(result.get("needs_literature")) or explicit or low_coverage
@@ -459,7 +474,7 @@ class NanofiltrationRAGAgent:
                 )
             return {"answer": answer}
         if not self.llm.configured:
-            lines = ["已检索到以下原文证据；配置 SILICONFLOW_API_KEY 后可由 DeepSeek-V3.2 综合回答："]
+            lines = [f"已检索到以下原文证据；配置 SILICONFLOW_API_KEY 后可由 {self.llm.model_name} 综合回答："]
             for index, item in enumerate(evidence[:8], 1):
                 lines.append(f"{index}. {item.get('quote') or item.get('source_sentence', '')} {self._citation(item)}")
             return {"answer": "\n\n".join(lines)}

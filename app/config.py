@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     siliconflow_api_key: SecretStr | None = None
     siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
     llm_model: str = "Pro/deepseek-ai/DeepSeek-V3.2"
+    chat_llm_model: str = "deepseek-ai/DeepSeek-V4-Pro"
     llm_temperature: float = 0.1
     llm_timeout_seconds: int = 120
 

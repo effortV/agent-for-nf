@@ -8,7 +8,6 @@ from openai import AsyncOpenAI
 
 from app.config import Settings, get_settings
 
-
 JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.I)
 
 
@@ -17,8 +16,16 @@ class LLMNotConfigured(RuntimeError):
 
 
 class DeepSeekClient:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        model_name: str | None = None,
+        enable_thinking: bool | None = None,
+    ):
         self.settings = settings or get_settings()
+        self.model_name = model_name or self.settings.llm_model
+        self.enable_thinking = enable_thinking
         self._client: AsyncOpenAI | None = None
         if self.settings.siliconflow_api_key:
             self._client = AsyncOpenAI(
@@ -37,15 +44,20 @@ class DeepSeekClient:
         *,
         temperature: float | None = None,
         max_tokens: int = 4096,
+        enable_thinking: bool | None = None,
     ) -> str:
         if not self._client:
             raise LLMNotConfigured("未配置 SILICONFLOW_API_KEY")
-        response = await self._client.chat.completions.create(
-            model=self.settings.llm_model,
-            messages=messages,  # type: ignore[arg-type]
-            temperature=self.settings.llm_temperature if temperature is None else temperature,
-            max_tokens=max_tokens,
-        )
+        request: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": self.settings.llm_temperature if temperature is None else temperature,
+            "max_tokens": max_tokens,
+        }
+        thinking = self.enable_thinking if enable_thinking is None else enable_thinking
+        if thinking is not None and "DeepSeek-V4" in self.model_name:
+            request["extra_body"] = {"enable_thinking": thinking}
+        response = await self._client.chat.completions.create(**request)  # type: ignore[arg-type]
         return response.choices[0].message.content or ""
 
     async def json_chat(
@@ -54,6 +66,7 @@ class DeepSeekClient:
         system: str,
         user: str,
         max_tokens: int = 4096,
+        enable_thinking: bool | None = None,
     ) -> dict[str, Any] | list[Any]:
         text = await self.chat(
             [
@@ -61,6 +74,7 @@ class DeepSeekClient:
                 {"role": "user", "content": user},
             ],
             max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
         )
         cleaned = JSON_FENCE.sub("", text.strip())
         try:

@@ -213,6 +213,8 @@ def health() -> HealthRead:
         status="ok",
         database="sqlite" if settings.database_url.startswith("sqlite") else "postgresql",
         llm_configured=bool(settings.siliconflow_api_key),
+        llm_model=settings.llm_model,
+        chat_llm_model=settings.chat_llm_model,
         openalex_configured=bool(settings.openalex_api_key),
         unpaywall_configured=bool(settings.unpaywall_email),
         elsevier_configured=bool(settings.elsevier_api_key),
@@ -962,7 +964,7 @@ async def chat(payload: ChatRequest, db: Db) -> ChatResponse:
     conversation.index_version = kb.index_version
     db.commit()
 
-    agent = NanofiltrationRAGAgent(db)
+    agent = NanofiltrationRAGAgent(db, deep_thinking=payload.deep_thinking)
     try:
         result = await agent.answer(
             conversation,
@@ -1021,7 +1023,7 @@ async def chat(payload: ChatRequest, db: Db) -> ChatResponse:
         content=answer,
         evidence=result.evidence,
         tool_calls=result.tool_calls,
-        model_name=get_settings().llm_model,
+        model_name=agent.llm.model_name,
     )
     db.add(assistant_message)
     db.flush()

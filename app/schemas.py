@@ -54,6 +54,7 @@ class MessageRead(ORMModel):
     content: str
     evidence: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
+    model_name: str | None = None
     created_at: datetime
 
 
@@ -64,6 +65,7 @@ class ChatRequest(BaseModel):
     desired_new_count: int = Field(default=50, ge=0, le=200)
     knowledge_discovery: bool = True
     research_mode: Literal["deep_research", "evidence_strict", "rapid"] = "deep_research"
+    deep_thinking: bool = True
 
 
 class ChatResponse(BaseModel):
@@ -352,6 +354,8 @@ class HealthRead(BaseModel):
     status: str
     database: str
     llm_configured: bool
+    llm_model: str
+    chat_llm_model: str
     openalex_configured: bool
     unpaywall_configured: bool
     elsevier_configured: bool

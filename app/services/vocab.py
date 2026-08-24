@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from app.services.llm import DeepSeekClient, LLMNotConfigured
 
+from app.services.llm import DeepSeekClient, LLMNotConfigured
 
 CATEGORIES = ("zh", "en", "abbreviations", "broader", "narrower", "materials", "methods", "systems", "metrics")
 
@@ -49,6 +49,7 @@ class VocabularyExpander:
                 ),
                 user=json.dumps(prompt, ensure_ascii=False),
                 max_tokens=2500,
+                enable_thinking=False,
             )
         except (LLMNotConfigured, ValueError, json.JSONDecodeError):
             return local
