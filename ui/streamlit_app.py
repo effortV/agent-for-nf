@@ -325,7 +325,7 @@ def render_processing_center(knowledge_base_id: str) -> None:
     metrics = st.columns(5)
     metrics[0].metric("正在处理任务", len(running))
     metrics[1].metric("排队/等待恢复", len(queued))
-    metrics[2].metric("等待你选文献", len(awaiting))
+    metrics[2].metric("手动采集待确认", len(awaiting))
     metrics[3].metric("队列待处理文献", sum(int((item.get("counts") or {}).get("selected") or 0) for item in queued))
     metrics[4].metric("最近完成/失败", len(recent_completed))
     st.caption("该区域每 5 秒自动刷新。整批进度与当前单篇进度分开显示；上传、公开网址和单篇修复进入优先队列。")
@@ -357,7 +357,7 @@ def render_processing_center(knowledge_base_id: str) -> None:
                     )
                     render_job_controls(job, key_prefix=f"processing-queued-{index}")
     if awaiting:
-        with st.expander(f"等待你确认候选（{len(awaiting)}）"):
+        with st.expander(f"手动采集等待确认（{len(awaiting)}）"):
             for index, job in enumerate(awaiting[:30], 1):
                 counts = job.get("counts") or {}
                 with st.container(border=True):
@@ -365,6 +365,28 @@ def render_processing_center(knowledge_base_id: str) -> None:
                         f"**{job.get('query')}** · 新候选 {counts.get('new', 0)} 篇 · "
                         f"已有 {counts.get('existing', 0)} 篇"
                     )
+                    st.caption("这里只保留手动采集的候选。对话 Agent 和持续自动采集会自动选择并入库。")
+                    if st.button(
+                        "打开候选并选择",
+                        key=f"processing-open-candidates-{job['id']}",
+                        type="primary",
+                    ):
+                        try:
+                            candidates = api("GET", f"/jobs/{job['id']}/candidates")
+                            st.session_state.manual_discovery = {
+                                "job_id": job["id"],
+                                "expanded_terms": job.get("expanded_terms") or {},
+                                "connector_status": counts.get("connector_status") or {},
+                                "total_found": int(counts.get("total_found") or len(candidates)),
+                                "existing_count": int(counts.get("existing") or 0),
+                                "new_count": int(counts.get("new") or 0),
+                                "candidates": candidates,
+                            }
+                            st.session_state.manual_desired = min(50, int(counts.get("new") or 0))
+                            st.session_state.processing_notice = "候选已恢复；请在下方手动采集区选择并确认入库。"
+                            st.rerun()
+                        except RuntimeError as exc:
+                            st.error(str(exc))
                     render_job_controls(job, key_prefix=f"processing-awaiting-{index}")
     if recent_completed:
         with st.expander("最近完成或失败的任务"):
@@ -546,15 +568,15 @@ def render_chat_module(conversation: dict[str, Any]) -> None:
         value=True,
         help="默认开启；关闭后仍使用 DeepSeek-V4-Pro，但不启用 enable_thinking，可降低等待时间和用量。",
     )
-    proactive = literature_col.toggle("证据不足或你要求找文献时，主动检索新文献", value=True)
-    desired = count_col.number_input("预选新文献", min_value=0, max_value=200, value=50, step=10)
+    proactive = literature_col.toggle("证据不足或你要求找文献时，自动检索并入库", value=True)
+    desired = count_col.number_input("自动新增上限", min_value=0, max_value=200, value=50, step=10)
     knowledge_discovery = st.toggle(
         "启用跨文献知识发现（规律、矛盾、机理假设和验证实验）",
         value=True,
         help="生成内容会保存为 AI综合/AI假设，不会冒充论文事实，并在本对话下方提供审核。",
     )
     if desired == 0:
-        st.caption("选择 0：不发现或新增文献，只使用现有知识库问答。")
+        st.caption("选择 0：不发现或新增文献，只使用现有知识库问答。大于 0 时对话 Agent 自动去重并入库，无需确认。")
     if st.session_state.get("active_job"):
         with st.expander("当前入库任务", expanded=False):
             render_job(st.session_state.active_job, key_prefix="chat", embedded=True)
@@ -581,8 +603,13 @@ def render_chat_module(conversation: dict[str, Any]) -> None:
                     },
                 )
                 if result.get("discovery"):
-                    st.session_state.chat_discovery = result["discovery"]
-                    st.session_state.chat_desired = int(desired)
+                    discovery = result["discovery"]
+                    if discovery.get("selection_mode") == "automatic":
+                        st.session_state.active_job = discovery["job_id"]
+                        st.session_state.pop("chat_discovery", None)
+                    else:
+                        st.session_state.chat_discovery = discovery
+                        st.session_state.chat_desired = int(desired)
                 if result.get("literature_error"):
                     st.session_state.chat_literature_error = result["literature_error"]
                 load_conversations.clear()

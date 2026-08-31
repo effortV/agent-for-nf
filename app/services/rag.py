@@ -469,7 +469,8 @@ class NanofiltrationRAGAgent:
             )
             if state.get("needs_literature"):
                 answer += (
-                    f"\n\n建议补充主题：{state.get('literature_query')}。新文献经你确认并入库后，"
+                    f"\n\n建议补充主题：{state.get('literature_query')}。对话 Agent 会按本轮新增上限自动去重并入库；"
+                    "后台处理完成后，"
                     "后续回答仍会重新检索整个知识库，而不是只查看本轮新增文献。"
                 )
             return {"answer": answer}

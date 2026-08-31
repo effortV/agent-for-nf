@@ -19,3 +19,12 @@ def test_search_queries_are_domain_anchored() -> None:
     assert queries
     assert any("nanofiltration" in query for query in queries)
 
+
+def test_machine_learning_expansion_searches_the_intersection() -> None:
+    expander = VocabularyExpander(llm=NoLLM())
+    terms = expander.local_expand("帮我梳理纳滤领域和机器学习相关研究的进展")
+    queries = expander.search_queries(terms)
+    assert "machine learning" in terms["en"]
+    assert "artificial neural network" in terms["en"]
+    assert any("nanofiltration" in query and "machine learning" in query for query in queries)
+    assert not any(query == "nanofiltration" for query in queries)

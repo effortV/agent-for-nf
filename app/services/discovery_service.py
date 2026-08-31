@@ -86,10 +86,13 @@ class DiscoveryService:
             )
             db.add(row)
             rows.append(row)
+        previous_counts = dict(job.counts or {})
+        selection_mode = str(previous_counts.get("selection_mode") or "manual")
         job.status = JobStatus.awaiting_selection
-        job.stage = "等待用户选择"
+        job.stage = "检索完成，准备自动入库" if selection_mode == "automatic" else "等待用户选择"
         job.progress = 0.25
         job.counts = {
+            **previous_counts,
             "total_found": len(rows),
             "existing": existing_count,
             "new": len(rows) - existing_count,

@@ -7,6 +7,41 @@ from app.services.llm import DeepSeekClient, LLMNotConfigured
 
 CATEGORIES = ("zh", "en", "abbreviations", "broader", "narrower", "materials", "methods", "systems", "metrics")
 
+MACHINE_LEARNING_MARKERS = (
+    "机器学习",
+    "深度学习",
+    "人工神经网络",
+    "machine learning",
+    "deep learning",
+    "artificial neural network",
+    "neural network",
+    "materials informatics",
+    "data-driven",
+)
+
+MACHINE_LEARNING_TERMS = (
+    "machine learning",
+    "deep learning",
+    "artificial neural network",
+    "data-driven modeling",
+    "materials informatics",
+    "random forest",
+    "support vector machine",
+    "gradient boosting",
+    "Gaussian process",
+    "Bayesian optimization",
+    "surrogate model",
+)
+
+
+def is_machine_learning_focus(expanded: dict[str, list[str]]) -> bool:
+    haystack = " ".join(
+        str(term).casefold()
+        for category in CATEGORIES
+        for term in expanded.get(category, [])
+    )
+    return any(marker.casefold() in haystack for marker in MACHINE_LEARNING_MARKERS)
+
 
 class VocabularyExpander:
     def __init__(self, llm: DeepSeekClient | None = None, vocab_path: Path | None = None):
@@ -29,6 +64,23 @@ class VocabularyExpander:
         # All NF searches should retain the domain anchor to control false positives.
         result["en"].extend(["nanofiltration", "nanofiltration membrane"])
         result["zh"].append("纳滤")
+        if any(marker.casefold() in lowered for marker in MACHINE_LEARNING_MARKERS):
+            result["zh"].extend(["机器学习", "深度学习", "人工神经网络", "数据驱动"])
+            result["en"].extend(MACHINE_LEARNING_TERMS)
+            result["abbreviations"].extend(["ML", "DL", "ANN", "SVM", "RF", "XGBoost", "QSPR"])
+            result["methods"].extend(
+                [
+                    "performance prediction",
+                    "fouling prediction",
+                    "process optimization",
+                    "inverse membrane design",
+                    "feature importance",
+                    "explainable artificial intelligence",
+                ]
+            )
+            result["metrics"].extend(
+                ["permeance prediction", "rejection prediction", "selectivity prediction", "model validation"]
+            )
         return {key: list(dict.fromkeys(item.strip() for item in values if item.strip())) for key, values in result.items()}
 
     async def expand(self, query: str) -> dict[str, list[str]]:
@@ -65,6 +117,21 @@ class VocabularyExpander:
 
     @staticmethod
     def search_queries(expanded: dict[str, list[str]], max_queries: int = 8) -> list[str]:
+        if is_machine_learning_focus(expanded):
+            # Search the intersection rather than issuing broad NF-only queries. The
+            # set covers reviews, membrane/material prediction, process operation,
+            # fouling and inverse design for a complete research-progress question.
+            queries = [
+                "nanofiltration machine learning",
+                "nanofiltration membrane machine learning review",
+                "nanofiltration performance prediction artificial neural network",
+                "nanofiltration membrane data-driven modeling",
+                "nanofiltration fouling prediction machine learning",
+                "nanofiltration process optimization machine learning",
+                "nanofiltration materials informatics inverse design",
+                "纳滤 机器学习",
+            ]
+            return queries[:max_queries]
         anchors = expanded.get("zh", [])[:2] + expanded.get("en", [])[:5]
         qualifiers = (
             expanded.get("materials", [])[:2]

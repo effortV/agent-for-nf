@@ -69,6 +69,7 @@ from app.services.fulltext import FullTextResolver
 from app.services.pipeline import apply_control_checkpoint, append_job_log, run_import_job
 from app.services.queue import enqueue_import
 from app.services.rag import NanofiltrationRAGAgent
+from app.services.vocab import VocabularyExpander
 from app.services.graph_store import GraphStore
 from app.services.storage import ObjectStorage
 from app.services.training import trace_to_read, traces_to_jsonl, training_quality
@@ -330,6 +331,7 @@ async def discover(payload: DiscoveryRequest, db: Db) -> DiscoveryResponse:
         knowledge_base_id=conversation.knowledge_base_id,
         query=payload.query,
         status=JobStatus.queued,
+        counts={"selection_mode": "manual", "source": "manual_discovery"},
     )
     db.add(job)
     db.commit()
@@ -953,7 +955,7 @@ def retry_metadata_only_documents(
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(payload: ChatRequest, db: Db) -> ChatResponse:
+async def chat(payload: ChatRequest, background_tasks: BackgroundTasks, db: Db) -> ChatResponse:
     conversation = get_or_404(db, Conversation, payload.conversation_id)
     kb = get_or_404(db, KnowledgeBase, conversation.knowledge_base_id)
     user_message = Message(conversation_id=conversation.id, role="user", content=payload.question)
@@ -984,6 +986,11 @@ async def chat(payload: ChatRequest, db: Db) -> ChatResponse:
             query=result.literature_query or result.standalone_question,
             status=JobStatus.queued,
             stage="对话 Agent 主动发现",
+            counts={
+                "selection_mode": "automatic",
+                "source": "chat_agent",
+                "auto_import_target": payload.desired_new_count,
+            },
         )
         db.add(discovery_job)
         db.commit()
@@ -1000,12 +1007,48 @@ async def chat(payload: ChatRequest, db: Db) -> ChatResponse:
             discovery_model = discovery_to_schema(discovery_job, rows)
             discovery_payload = discovery_model.model_dump(mode="json")
             selectable = min(payload.desired_new_count, discovery_model.new_count)
-            answer += (
-                f"\n\n我还发现了 {discovery_model.new_count} 篇去重后的新候选，"
-                f"已按相关性预选前 {selectable} 篇；请在当前页面确认后再入库。"
+            document_ids = create_documents_from_candidates(db, discovery_job, top_n=selectable)
+            selected_count = len(document_ids)
+            if document_ids:
+                db.commit()
+                if not enqueue_import(discovery_job.id):
+                    background_tasks.add_task(run_import_job, discovery_job.id)
+                answer += (
+                    f"\n\n我还发现了 {discovery_model.new_count} 篇去重后的新候选，"
+                    f"已按相关性自动选择并提交 {selected_count} 篇解析入库，无需手动确认。"
+                    "后台完成后会立即参与整个知识库的图谱、向量和全文检索；你可在处理中心查看进度。"
+                )
+            else:
+                discovery_job.requested_count = 0
+                discovery_job.selected_document_ids = []
+                discovery_job.status = JobStatus.completed
+                discovery_job.stage = "没有去重后的可新增文献"
+                discovery_job.progress = 1.0
+                discovery_job.completed_at = datetime.now(timezone.utc)
+                counts = dict(discovery_job.counts or {})
+                counts["execution_state"] = "completed"
+                discovery_job.counts = counts
+                append_job_log(discovery_job, "completed", "主动检索完成，没有可自动新增的文献")
+                db.commit()
+                answer += (
+                    f"\n\n本轮发现 {discovery_model.new_count} 篇新候选，但在入库前的最终唯一性检查后"
+                    "没有可新增文献；现有知识库保持不变。"
+                )
+            discovery_payload.update(
+                {
+                    "selection_mode": "automatic",
+                    "auto_imported_count": selected_count,
+                }
             )
             result.tool_calls.append(
-                {"tool": "proactive_literature_discovery", "job_id": discovery_job.id, "new_count": discovery_model.new_count}
+                {
+                    "tool": "proactive_literature_discovery",
+                    "job_id": discovery_job.id,
+                    "new_count": discovery_model.new_count,
+                    "auto_imported_count": selected_count,
+                    "selection_mode": "automatic",
+                    "search_queries": VocabularyExpander.search_queries(discovery_job.expanded_terms or {}),
+                }
             )
         except Exception as exc:
             db.rollback()

@@ -14,6 +14,7 @@ import httpx
 
 from app.config import Settings, get_settings
 from app.services.dedupe import normalize_doi, normalize_openalex_id, title_author_fingerprint
+from app.services.vocab import MACHINE_LEARNING_TERMS, is_machine_learning_focus
 
 
 def usable_fulltext_hint(value: str | None) -> str | None:
@@ -573,6 +574,7 @@ class LiteratureDiscovery:
     @staticmethod
     def _score(candidates: list[LiteratureCandidate], expanded: dict[str, list[str]]) -> None:
         topic_terms = expanded.get("zh", []) + expanded.get("en", []) + expanded.get("abbreviations", [])
+        machine_learning_focus = is_machine_learning_focus(expanded)
         detail_terms = (
             expanded.get("materials", [])
             + expanded.get("methods", [])
@@ -598,6 +600,26 @@ class LiteratureDiscovery:
                 reasons.append("题名主题词: " + ", ".join(title_hits[:4]))
             if detail_hits:
                 reasons.append("材料/方法/体系命中: " + ", ".join(detail_hits[:4]))
+            if machine_learning_focus:
+                ml_terms = [
+                    *MACHINE_LEARNING_TERMS,
+                    "机器学习",
+                    "深度学习",
+                    "人工神经网络",
+                    "neural network",
+                    "xgboost",
+                ]
+                ml_title_hits = list(dict.fromkeys(term for term in ml_terms if term.casefold() in title))
+                ml_abstract_hits = list(dict.fromkeys(term for term in ml_terms if term.casefold() in abstract))
+                if ml_title_hits:
+                    score += min(7.5, len(ml_title_hits) * 2.5)
+                    reasons.append("题名直接命中机器学习: " + ", ".join(ml_title_hits[:4]))
+                elif ml_abstract_hits:
+                    score += min(4.0, len(ml_abstract_hits) * 0.8)
+                    reasons.append("摘要直接命中机器学习: " + ", ".join(ml_abstract_hits[:4]))
+                else:
+                    score -= 5.0
+                    reasons.append("未直接命中机器学习主题，已降权")
             if item.is_open_access:
                 score += 0.35
                 reasons.append("存在开放全文线索")

@@ -46,6 +46,32 @@ def test_relevance_score_prefers_domain_title() -> None:
     assert relevant.relevance_score > other.relevance_score
 
 
+def test_machine_learning_focus_penalizes_traditional_nf_papers() -> None:
+    ml_paper = LiteratureCandidate.create(
+        source="test",
+        title="Machine learning prediction of nanofiltration membrane performance",
+        authors=[],
+        abstract="A data-driven model predicts permeance and rejection.",
+    )
+    traditional = LiteratureCandidate.create(
+        source="test",
+        title="Nanofiltration membrane prepared by interfacial polymerization",
+        authors=[],
+        abstract="Membrane synthesis and salt rejection experiments.",
+    )
+    expanded = {
+        "zh": ["机器学习", "纳滤"],
+        "en": ["nanofiltration", "machine learning"],
+        "abbreviations": ["ML"],
+        "materials": [],
+        "methods": ["performance prediction"],
+        "systems": [],
+        "metrics": [],
+    }
+    LiteratureDiscovery._score([ml_paper, traditional], expanded)
+    assert ml_paper.relevance_score > traditional.relevance_score + 5
+
+
 def test_connector_auth_headers_are_added() -> None:
     discovery = LiteratureDiscovery(
         Settings(
