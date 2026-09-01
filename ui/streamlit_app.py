@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -74,6 +76,46 @@ def ensure_conversation() -> str:
     return st.session_state.conversation_id
 
 
+CONVERSATION_UI_STATE_KEYS = (
+    "chat_discovery",
+    "manual_discovery",
+    "active_job",
+    "chat_desired",
+    "chat_literature_error",
+)
+
+
+def clear_conversation_ui_state() -> None:
+    for key in CONVERSATION_UI_STATE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def conversation_labels(conversations: list[dict[str, Any]]) -> dict[str, str]:
+    """Make duplicate titles distinguishable while keeping unique titles compact."""
+
+    title_counts = Counter(str(item.get("title") or "新对话").strip() for item in conversations)
+    labels: dict[str, str] = {}
+    china_tz = timezone(timedelta(hours=8))
+    for item in conversations:
+        conversation_id = str(item["id"])
+        title = str(item.get("title") or "新对话").strip()
+        if title_counts[title] <= 1 and title != "新对话":
+            labels[conversation_id] = title
+            continue
+        timestamp = "时间未知"
+        raw_time = item.get("updated_at") or item.get("created_at")
+        if raw_time:
+            try:
+                parsed = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                timestamp = parsed.astimezone(china_tz).strftime("%m-%d %H:%M")
+            except ValueError:
+                pass
+        labels[conversation_id] = f"[{timestamp} · {conversation_id[:4]}] {title}"
+    return labels
+
+
 def render_sidebar() -> str:
     with st.sidebar:
         st.title("🧪 NF-Atlas")
@@ -86,22 +128,25 @@ def render_sidebar() -> str:
         if st.button("＋ 新建对话", use_container_width=True):
             created = api("POST", "/conversations", json={"title": "新对话"})
             st.session_state.conversation_id = created["id"]
-            for key in ("chat_discovery", "manual_discovery", "active_job"):
-                st.session_state.pop(key, None)
+            st.session_state.conversation_selector = created["id"]
+            clear_conversation_ui_state()
             load_conversations.clear()
             st.rerun()
         current_id = ensure_conversation()
-        labels = {item["id"]: item["title"] for item in conversations}
+        labels = conversation_labels(conversations)
         labels.setdefault(current_id, "新对话")
+        option_ids = list(labels)
+        if st.session_state.get("conversation_selector") not in option_ids:
+            st.session_state.conversation_selector = current_id
         selected = st.selectbox(
             "历史对话",
-            options=list(labels),
-            index=list(labels).index(current_id),
+            options=option_ids,
             format_func=lambda item: labels[item],
+            key="conversation_selector",
         )
         if selected != current_id:
             st.session_state.conversation_id = selected
-            st.session_state.pop("chat_discovery", None)
+            clear_conversation_ui_state()
             st.rerun()
         with st.expander("管理当前对话"):
             st.caption("删除对话会移除消息和对应训练轨迹；已入库文献、知识库和知识成果继续保留。")
@@ -119,8 +164,8 @@ def render_sidebar() -> str:
                 try:
                     api("DELETE", f"/conversations/{selected}")
                     st.session_state.pop("conversation_id", None)
-                    for key in ("chat_discovery", "manual_discovery", "active_job"):
-                        st.session_state.pop(key, None)
+                    st.session_state.pop("conversation_selector", None)
+                    clear_conversation_ui_state()
                     load_conversations.clear()
                     st.session_state.conversation_deleted = True
                     st.rerun()
