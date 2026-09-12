@@ -3,5 +3,10 @@
 __pycache__
 .pytest_cache
 data/runtime
+data/library
+backups
+migration
+*.tar
+*.zip
 .env
 
