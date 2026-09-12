@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
@@ -12,7 +12,7 @@ from app.db import Base
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def new_uuid() -> str:
@@ -183,6 +183,82 @@ class ExtractedFact(Base):
     raw_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
     document: Mapped[Document] = relationship(back_populates="facts")
+
+
+class LocalLibraryItem(Base):
+    """Searchable catalogue row for a locally mounted full-text collection."""
+
+    __tablename__ = "local_library_items"
+    __table_args__ = (
+        UniqueConstraint("source_name", "source_key", name="uq_local_library_source_key"),
+        Index("ix_local_library_doi", "doi_normalized"),
+        Index("ix_local_library_title", "title"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    source_name: Mapped[str] = mapped_column(String(120), default="AI4Membrane lib")
+    source_key: Mapped[str] = mapped_column(String(120))
+    doi: Mapped[str | None] = mapped_column(String(300))
+    doi_normalized: Mapped[str | None] = mapped_column(String(300))
+    title: Mapped[str] = mapped_column(Text)
+    title_author_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    authors: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    abstract: Mapped[str | None] = mapped_column(Text)
+    publication_year: Mapped[int | None] = mapped_column(Integer)
+    venue: Mapped[str | None] = mapped_column(String(500))
+    landing_url: Mapped[str | None] = mapped_column(Text)
+    attachment_path: Mapped[str | None] = mapped_column(Text)
+    attachment_exists: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ExtractionProfile(Base):
+    """Versioned, conversation-derived schema for a research question."""
+
+    __tablename__ = "extraction_profiles"
+    __table_args__ = (
+        UniqueConstraint("knowledge_base_id", "schema_hash", name="uq_extraction_profile_kb_hash"),
+        Index("ix_extraction_profile_conversation", "conversation_id", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id", ondelete="SET NULL"), index=True)
+    name: Mapped[str] = mapped_column(String(240))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    research_question: Mapped[str] = mapped_column(Text)
+    schema_hash: Mapped[str] = mapped_column(String(64))
+    schema_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    prompt_text: Mapped[str] = mapped_column(Text)
+    model_name: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(40), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class DocumentExtraction(Base):
+    """Reusable extraction artifact; one result per document and profile version."""
+
+    __tablename__ = "document_extractions"
+    __table_args__ = (
+        UniqueConstraint("document_id", "profile_id", name="uq_document_extraction_profile"),
+        Index("ix_document_extraction_status", "profile_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    profile_id: Mapped[str] = mapped_column(ForeignKey("extraction_profiles.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(40), default="queued")
+    total_batches: Mapped[int] = mapped_column(Integer, default=0)
+    completed_batches: Mapped[int] = mapped_column(Integer, default=0)
+    facts_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    model_name: Mapped[str | None] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class KnowledgeInsight(Base):

@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     retrieval_top_k: int = 8
     max_discovery_results: int = 500
 
+    # Zotero-style full-text collection searched before remote literature APIs.
+    local_library_root: Path | None = None
+    local_library_catalog: str = "AI4Membrane library.csv"
+    local_library_auto_sync: bool = True
+    local_library_search_limit: int = 500
+    extraction_profile_document_limit: int = 24
+
     # Public-web full text fallback. It only reads publicly reachable HTTP(S)
     # resources and never handles logins, cookies, CAPTCHAs or paywall bypasses.
     direct_web_fetch: bool = True
@@ -78,10 +85,10 @@ class Settings(BaseSettings):
     direct_web_max_redirects: int = 8
     direct_html_min_chars: int = 3000
 
-    @field_validator("storage_root", "chroma_path", mode="before")
+    @field_validator("storage_root", "chroma_path", "local_library_root", mode="before")
     @classmethod
-    def expand_path(cls, value: str | Path) -> Path:
-        return Path(value).expanduser()
+    def expand_path(cls, value: str | Path | None) -> Path | None:
+        return Path(value).expanduser() if value not in {None, ""} else None
 
     @property
     def cors_origin_list(self) -> list[str]:

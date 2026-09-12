@@ -72,3 +72,18 @@ NF_ATLAS_ALLOW_RESTORE=YES scripts/server_restore.sh \
 ```
 
 Redis 队列不直接还原，避免陈旧 RQ 调用重复执行。Worker 会从 PostgreSQL 的任务记录安全恢复，数据库唯一约束和四级查重会跳过已经入库的文献。
+## 挂载 AI4Membrane 全文库
+
+服务器项目中的文献目录为：
+
+```text
+/home/root2/data/zzh/agent for nf/data/library/AI4Membrane lib
+```
+
+在服务器 `.env` 设置：
+
+```dotenv
+LOCAL_LIBRARY_HOST_PATH=./data/library/AI4Membrane lib
+```
+
+Compose 会把它只读挂载到 API、普通 Worker 和优先 Worker 的 `/library/AI4Membrane lib`。更新代码或重建容器不会删除该目录。

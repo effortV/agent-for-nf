@@ -15,7 +15,7 @@ Streamlit Cloud 公开前端（无知识库数据）
       ├─ Neo4j/SQL facts              ├─ DeepSeek 词表扩展
       ├─ Chroma + bge-m3              ├─ OpenAlex/Crossref/S2/Elsevier 检索
       ├─ SQL keyword                  ├─ 四级查重 + 公开网页/合法全文获取
-      └─ AIInsight memory             ├─ 题名摘要文献自动补全文升级
+      └─ AIInsight memory             ├─ AI4Membrane 本地全文优先
           │                           ├─ MinerU/GROBID/PyMuPDF 解析
      DeepSeek 有证据回答              ├─ DeepSeek 结构化抽取
           │                           └─ Neo4j + Chroma 入库
@@ -27,7 +27,8 @@ PDF/XML/解析 JSON ── 本地目录或 MinIO
 ## 已落实的关键约束
 
 - 输入“界面聚合”“盐湖提锂”“抗污染膜”等主题后，先合并领域内置词表与 DeepSeek 中英文扩词，再向 OpenAlex、Crossref、Semantic Scholar 和已配置的 ScienceDirect API 发起真实检索。
-- 对话 Agent 会读取近期消息和滚动摘要，把“它呢”“继续找相关的”等追问改写为独立问题；图谱/向量检索后再判断知识缺口，并在用户启用时主动生成文献候选。候选仍需用户确认，不会擅自批量导入。
+- 对话 Agent 会读取近期消息和滚动摘要，把“它呢”“继续找相关的”等追问改写为独立问题；图谱/向量检索后再判断知识缺口。对话中启用主动补充时，会按用户设定数量自动选取并入库，无需再次确认；文献页的手动采集仍由用户确认。
+- 检索优先扫描只读挂载的 `AI4Membrane lib` 题录和全文附件，再调用 OpenAlex、Crossref、Semantic Scholar、Elsevier 等渠道补充新论文。本地全文不会被复制一份才参与发现；只有选中的论文进入解析流程。知识库已学过的本地论文不会挤掉 API 找到的新论文。
 - 文献模块支持手动采集 50～200 篇和 Redis/RQ 持续自动采集。自动任务逐轮扩词、检索、查重、入库并定时安排下一轮，可从页面安全停止或重启。
 - Worker 启动时会把 PostgreSQL 中未完成、但 Redis 已丢失执行者的导入/自动采集任务重新入队；断点恢复会跳过 `indexed` 文献，不重复下载、解析、抽取或调用模型计费。
 - “后台文献处理中心”每 5 秒自动刷新，集中展示运行中、排队中、等待选择和最近完成/失败任务；每个运行任务会显示当前文献题名、DOI、批次位置、题名/摘要或全文 PDF/XML/JATS/HTML 模式、全文来源、文件保存状态、切片数、结构化事实数，以及单篇和整批两级进度。用户上传、公开网址/DOI 导入和单篇全文补充进入高优先级队列，批量采集进入普通文献队列。
@@ -42,12 +43,14 @@ PDF/XML/解析 JSON ── 本地目录或 MinIO
 - Crossref、Semantic Scholar 等渠道按各自速率串行/并发控制，对 HTTP 429 读取 `Retry-After` 或指数退避重试；Elsevier 401/403 会立即熔断本轮该渠道，其他来源继续返回结果。
 - MinerU 可用命令模板接入；未配置或失败时依次回退 GROBID、PyMuPDF。正文、表格、图注和解析结果按文献持久化。
 - DeepSeek 分批抽取膜材料、膜批次、工艺、条件、溶质、性能、结构和机理；性能事实绑定原句、页码、表格、DOI、条件、单位及置信度。常见压力、温度、通量/渗透率单位会规范化。
+- Agent 会从当前研究问题、上下文摘要和研究任务自动生成版本化抽取方案。换成机器学习、盐湖提锂、抗污染或其他研究方向时，系统直接复用已经保存的正文切片，只运行新增字段的结构化抽取；旧方案和旧结果不会覆盖，也无需重新读 PDF。
 - 结构化事实写入 Neo4j，同时保留 PostgreSQL 事实表作为审核记录与图谱不可用时的检索回退；全文切片使用 `BAAI/bge-m3` 写入 Chroma。
 - 每次回答先扫描整个知识库文献清单和全部已有切片，再进行纳滤中英文词表扩展。LangGraph 路由材料/性能/实验关系问题到图谱，机理/综述问题到向量检索，复杂问题使用混合检索；关键词检索始终作为补充。只有最终送入 LLM 的引用证据按相关性和独立文献覆盖度压缩，因此上下文条数限制不会变成知识库扫描范围限制。回答提示强制使用 DOI、页码和短原文证据。
 - 开启“跨文献知识发现”后，DeepSeek 会在本次命中的多篇证据之间寻找 `pattern`、`contradiction` 和 `hypothesis`。每条结果都保存支持/反对证据、来源模式、置信度、新颖性、假设、适用边界及验证/证伪方案；只靠题名摘要时置信度上限为 0.45，混合摘要证据上限为 0.65，全文证据上限为 0.82。
 - AI 发现保存为 Neo4j `AIInsight` 节点，并通过 `SUPPORTED_BY` / `CONTRADICTED_BY` 连接文献。状态分为 AI 综合、AI 假设、人工已审阅、实验/外部证据已验证和驳回；只有人工明确填写验证依据后才能标记为“已验证”。历史 AI 假设只作为推理记忆，不会被当作论文原始证据引用。
 - 对话、滚动摘要字段、当前任务、引用证据、工具轨迹、新增记录、索引版本和人工反馈都在数据库持久化。关闭页面或重启服务不会清空外部卷。
 - 高质量轨迹可经人工评分、修订和授权后导出为 `instruction`、`input`、`output` JSONL，供后续合规 LoRA/蒸馏使用。
+- “训练数据中心”可导出/导入 NF-Atlas 可迁移知识包，保存题录、解析切片、基础事实、版本化抽取结果和 AI 知识发现。导入后仅用本地 `bge-m3` 重建 Chroma/Neo4j，不重新解析 PDF、不重复调用 DeepSeek；源 PDF 因体积和权限原因由外接硬盘或服务器文献目录单独保存。
 
 ## 目录
 
@@ -65,6 +68,9 @@ app/
     vector_store.py       bge-m3/Chroma 持久向量索引
     rag.py                LangGraph 混合 RAG 与证据回答
     knowledge_discovery.py 跨文献规律、矛盾、假设与验证计划
+    local_library.py       AI4Membrane/Zotero 题录扫描、路径重映射与全文优先检索
+    extraction_profiles.py 对话驱动的版本化抽取方案和断点续抽
+    knowledge_bundle.py    已学习题录/切片/事实/方案的迁移包
     pipeline.py           文献后台处理状态机
     automation.py         Redis/RQ 持续发现、停止和下一轮调度
     import_service.py     用户选择和自动任务共用的并发安全导入
@@ -90,7 +96,16 @@ SILICONFLOW_API_KEY=你的硅基流动密钥
 OPENALEX_API_KEY=你的免费OpenAlex密钥
 OPENALEX_EMAIL=你的联系邮箱
 UNPAYWALL_EMAIL=你的联系邮箱
+LOCAL_LIBRARY_HOST_PATH=/mnt/f/AI4Membrane lib
 ```
+
+本地 WSL/Docker 使用上面的 F 盘路径。服务器部署改为：
+
+```dotenv
+LOCAL_LIBRARY_HOST_PATH=./data/library/AI4Membrane lib
+```
+
+容器内统一只读挂载为 `/library/AI4Membrane lib`，不会移动、删除或改写原始 PDF。
 
 按权限选填 `SEMANTIC_SCHOLAR_API_KEY`、`ELSEVIER_API_KEY` 和 `ELSEVIER_INSTTOKEN`。OpenAlex 从 2026-02-13 起要求 API key。ScienceDirect TDM 是否能返回全文取决于 API Key 对应的授权范围、机构 IP 或 insttoken；系统不会绕过订阅权限。
 
@@ -179,13 +194,14 @@ MINERU_COMMAND=mineru -p {input} -o {output}
 ## 使用流程
 
 1. 打开 Streamlit，新建或从侧栏恢复历史对话。
-2. 展开“扩充知识库”，输入主题并检索。
+2. 在文献页先点“扫描/更新全文目录”；之后输入主题时会优先返回 AI4Membrane 本地全文，再用文献 API 补新。
 3. 查看扩展词、已有文献推荐和去重后新候选；选择 0～200 篇并确认。
 4. 在任务区查看公开网页/全文、题名摘要兜底、解析、抽取和图谱/向量入库进度。没有合法全文的候选会明确以题名/摘要模式入库，不会伪造正文或页码。
 5. 已成功入库的单篇文献立即可以参与问答；任务结束后知识库索引版本递增。
 6. 免费全文没有被题录 API 识别时，在“公开网址/DOI导入”粘贴文章页或 PDF 地址；已有摘要记录会原位升级。也可在“文献阅读”批量重新检查摘要文献。
 7. 对订阅文献使用“合法全文上传”，确认权限后进入同一解析链。
 8. 继续在原对话提问，可打开“跨文献知识发现”。回答中的论文事实和 AI 推断分区显示；到“知识发现图谱”查看证据链、边界条件、验证计划并人工审核。
+9. 更换研究问题时无需重新解析已经学习的论文；到训练数据中心可查看各版抽取方案，并导出可迁移知识包。
 
 ## AI 知识发现的边界
 

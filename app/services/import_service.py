@@ -50,9 +50,44 @@ def create_documents_from_candidates(
             fingerprint=item.title_author_fingerprint,
         )
         if duplicate:
+            raw = item.raw_json or {}
+            local_path = raw.get("local_library_path") if item.source == "local-library" else None
+            metadata_only = duplicate.fulltext_source == "metadata-only" or bool(
+                (duplicate.metadata_json or {}).get("metadata_only")
+            )
+            if local_path and metadata_only:
+                metadata = dict(duplicate.metadata_json or {})
+                metadata.update(
+                    {
+                        "import_job_id": job.id,
+                        "candidate_id": item.candidate_id,
+                        "sources": item.source,
+                        "local_library_path": local_path,
+                        "local_library_key": raw.get("local_library_key"),
+                        "upgrade_pending": True,
+                    }
+                )
+                duplicate.metadata_json = metadata
+                duplicate.status = DocumentStatus.selected
+                duplicate.abstract = duplicate.abstract or item.abstract
+                duplicate.relevance_score = max(duplicate.relevance_score or 0.0, item.relevance_score or 0.0)
+                item.already_exists = True
+                item.duplicate_reason = "metadata-fulltext-upgrade"
+                document_ids.append(duplicate.id)
+                continue
             item.already_exists = True
             item.duplicate_reason = reason
             continue
+        raw = item.raw_json or {}
+        metadata = {"import_job_id": job.id, "candidate_id": item.candidate_id, "sources": item.source}
+        if item.source == "local-library" and raw.get("local_library_path"):
+            metadata.update(
+                {
+                    "local_library_path": raw["local_library_path"],
+                    "local_library_key": raw.get("local_library_key"),
+                    "local_library_item_id": raw.get("local_library_item_id"),
+                }
+            )
         document = Document(
             knowledge_base_id=job.knowledge_base_id,
             doi=item.doi,
@@ -72,7 +107,7 @@ def create_documents_from_candidates(
             relevance_score=item.relevance_score,
             relevance_reasons=item.relevance_reasons,
             status=DocumentStatus.selected,
-            metadata_json={"import_job_id": job.id, "candidate_id": item.candidate_id, "sources": item.source},
+            metadata_json=metadata,
         )
         db.add(document)
         try:

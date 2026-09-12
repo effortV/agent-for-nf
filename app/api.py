@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Response, UploadFile
@@ -18,12 +18,14 @@ from app.models import (
     Conversation,
     DiscoveryCandidate,
     Document,
+    DocumentExtraction,
     DocumentStatus,
     ExtractedFact,
+    ExtractionProfile,
     ImportJob,
     JobStatus,
-    KnowledgeInsight,
     KnowledgeBase,
+    KnowledgeInsight,
     LiteratureAutomation,
     Message,
     TrainingTrace,
@@ -40,16 +42,20 @@ from app.schemas import (
     DiscoveryRequest,
     DiscoveryResponse,
     DocumentDetail,
+    DocumentExtractionRead,
     DocumentRead,
+    ExtractionProfileRead,
     FeedbackRequest,
     HealthRead,
     ImportSelectionRequest,
     JobControlRead,
     JobRead,
-    KnowledgeInsightRead,
-    KnowledgeInsightReview,
     KnowledgeBaseCreate,
     KnowledgeBaseRead,
+    KnowledgeBundleImportRead,
+    KnowledgeInsightRead,
+    KnowledgeInsightReview,
+    LocalLibraryStatsRead,
     MessageRead,
     PublicUrlImportRequest,
     RetryMetadataRequest,
@@ -58,24 +64,25 @@ from app.schemas import (
     TrainingTraceReview,
     UploadResponse,
 )
-from app.services.dedupe import extract_doi, find_duplicate, normalize_doi, sha256_bytes, title_author_fingerprint
-from app.services.discovery_service import DiscoveryService, candidates_for_job
 from app.services.automation import (
     enqueue_automation_cycle,
     enqueue_automation_resume_cycle,
 )
-from app.services.import_service import ImportSelectionError, create_documents_from_candidates
+from app.services.dedupe import extract_doi, find_duplicate, normalize_doi, sha256_bytes, title_author_fingerprint
+from app.services.discovery_service import DiscoveryService, candidates_for_job
+from app.services.extraction_profiles import ExtractionProfileService
 from app.services.fulltext import FullTextResolver
-from app.services.pipeline import apply_control_checkpoint, append_job_log, run_import_job
+from app.services.graph_store import GraphStore
+from app.services.import_service import ImportSelectionError, create_documents_from_candidates
+from app.services.knowledge_bundle import export_knowledge_bundle, import_knowledge_bundle
+from app.services.local_library import LocalLibraryCatalog
+from app.services.pipeline import append_job_log, apply_control_checkpoint, run_import_job
 from app.services.queue import enqueue_import
 from app.services.rag import NanofiltrationRAGAgent
-from app.services.vocab import VocabularyExpander
-from app.services.graph_store import GraphStore
 from app.services.storage import ObjectStorage
-from app.services.training import trace_to_read, traces_to_jsonl, training_quality
 from app.services.task_control import (
-    CANCEL_STATES,
     CANCEL_REQUESTED,
+    CANCEL_STATES,
     PAUSE_REQUESTED,
     PAUSED,
     automation_is_deleted,
@@ -87,7 +94,8 @@ from app.services.task_control import (
     remove_queued_import_calls,
     request_job_control,
 )
-
+from app.services.training import trace_to_read, traces_to_jsonl, training_quality
+from app.services.vocab import VocabularyExpander
 
 router = APIRouter(prefix="/api")
 Db = Annotated[Session, Depends(get_db)]
@@ -160,6 +168,7 @@ def create_single_document_job(
     stage: str,
     upgraded: bool = False,
 ) -> ImportJob:
+    profile = latest_extraction_profile(db, conversation) if conversation else None
     job = ImportJob(
         conversation_id=conversation.id if conversation else None,
         knowledge_base_id=knowledge_base_id,
@@ -177,10 +186,76 @@ def create_single_document_job(
             "parsed": 0,
             "indexed": 0,
             "failed": 0,
+            "extraction_profile_id": profile.id if profile else None,
         },
     )
     db.add(job)
     db.flush()
+    return job
+
+
+def latest_extraction_profile(db: Session, conversation: Conversation | None) -> ExtractionProfile | None:
+    if not conversation:
+        return None
+    return db.scalar(
+        select(ExtractionProfile)
+        .where(ExtractionProfile.knowledge_base_id == conversation.knowledge_base_id)
+        .order_by(ExtractionProfile.updated_at.desc())
+        .limit(1)
+    )
+
+
+def enqueue_profile_extraction(
+    db: Session,
+    background_tasks: BackgroundTasks,
+    conversation: Conversation,
+    profile: ExtractionProfile,
+    evidence: list[dict],
+) -> ImportJob | None:
+    settings = get_settings()
+    ids = list(
+        dict.fromkeys(
+            str(item.get("document_id"))
+            for item in evidence
+            if item.get("document_id")
+        )
+    )[: settings.extraction_profile_document_limit]
+    if not ids:
+        return None
+    completed = set(
+        db.scalars(
+            select(DocumentExtraction.document_id).where(
+                DocumentExtraction.profile_id == profile.id,
+                DocumentExtraction.document_id.in_(ids),
+                DocumentExtraction.status == "completed",
+            )
+        )
+    )
+    pending = [item for item in ids if item not in completed and db.get(Document, item)]
+    if not pending:
+        return None
+    job = ImportJob(
+        conversation_id=conversation.id,
+        knowledge_base_id=conversation.knowledge_base_id,
+        query=f"研究抽取方案：{profile.name}",
+        requested_count=len(pending),
+        selected_document_ids=pending,
+        status=JobStatus.queued,
+        stage="等待复用已有切片进行研究抽取",
+        counts={
+            "job_type": "extraction_profile",
+            "extraction_profile_id": profile.id,
+            "selection_mode": "automatic",
+            "source": "conversation_profile",
+            "selected": len(pending),
+            "execution_state": "queued",
+            "worker_queue": settings.priority_queue_name,
+        },
+    )
+    db.add(job)
+    db.commit()
+    if not enqueue_import(job.id, high_priority=True):
+        background_tasks.add_task(run_import_job, job.id)
     return job
 
 
@@ -228,6 +303,105 @@ def health() -> HealthRead:
         queue_mode="redis/rq" if settings.use_rq else "fastapi-background",
         missing_recommended_settings=missing,
     )
+
+
+@router.get("/local-library", response_model=LocalLibraryStatsRead)
+def local_library_stats(db: Db) -> LocalLibraryStatsRead:
+    return LocalLibraryStatsRead(**LocalLibraryCatalog().stats(db))
+
+
+@router.post("/local-library/sync", response_model=LocalLibraryStatsRead)
+def sync_local_library(db: Db, force: bool = False) -> LocalLibraryStatsRead:
+    catalog = LocalLibraryCatalog()
+    if not catalog.configured:
+        raise HTTPException(409, "服务器尚未配置或挂载 AI4Membrane library.csv")
+    return LocalLibraryStatsRead(**catalog.sync(db, force=force))
+
+
+@router.get("/knowledge-bases/{knowledge_base_id}/extraction-profiles", response_model=list[ExtractionProfileRead])
+def list_extraction_profiles(knowledge_base_id: str, db: Db) -> list[ExtractionProfile]:
+    get_or_404(db, KnowledgeBase, knowledge_base_id)
+    return list(
+        db.scalars(
+            select(ExtractionProfile)
+            .where(ExtractionProfile.knowledge_base_id == knowledge_base_id)
+            .order_by(ExtractionProfile.updated_at.desc())
+            .limit(200)
+        )
+    )
+
+
+@router.get("/documents/{document_id}/extractions", response_model=list[DocumentExtractionRead])
+def list_document_extractions(document_id: str, db: Db) -> list[DocumentExtraction]:
+    get_or_404(db, Document, document_id)
+    return list(
+        db.scalars(
+            select(DocumentExtraction)
+            .where(DocumentExtraction.document_id == document_id)
+            .order_by(DocumentExtraction.updated_at.desc())
+        )
+    )
+
+
+@router.get("/knowledge-bases/{knowledge_base_id}/bundle/export")
+def export_portable_knowledge(knowledge_base_id: str, db: Db) -> Response:
+    knowledge_base = get_or_404(db, KnowledgeBase, knowledge_base_id)
+    try:
+        payload = export_knowledge_bundle(db, knowledge_base_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    safe_name = quote((knowledge_base.name or "nf-atlas").replace("/", "-")[:80])
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{safe_name}-knowledge.zip"},
+    )
+
+
+@router.post(
+    "/knowledge-bases/{knowledge_base_id}/bundle/import",
+    response_model=KnowledgeBundleImportRead,
+)
+async def import_portable_knowledge(
+    knowledge_base_id: str,
+    background_tasks: BackgroundTasks,
+    db: Db,
+    file: Annotated[UploadFile, File(description="NF-Atlas 可迁移知识包 ZIP")],
+) -> KnowledgeBundleImportRead:
+    get_or_404(db, KnowledgeBase, knowledge_base_id)
+    payload = await file.read()
+    try:
+        result = import_knowledge_bundle(db, knowledge_base_id, payload, rebuild_indexes=False)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    document_ids = result.pop("index_document_ids", [])
+    job_id = None
+    if document_ids:
+        job = ImportJob(
+            knowledge_base_id=knowledge_base_id,
+            query=f"迁移包索引重建：{file.filename or 'knowledge.zip'}",
+            requested_count=len(document_ids),
+            selected_document_ids=document_ids,
+            status=JobStatus.queued,
+            stage="等待重建 Chroma/Neo4j 索引",
+            counts={
+                "job_type": "knowledge_bundle_reindex",
+                "selected": len(document_ids),
+                "execution_state": "queued",
+                "worker_queue": get_settings().queue_name,
+                "indexed": 0,
+                "failed": 0,
+            },
+        )
+        db.add(job)
+        db.commit()
+        job_id = job.id
+        if not enqueue_import(job.id):
+            # A bundle import requires configured Chroma/Neo4j, so the persistent
+            # worker is preferred. This fallback keeps lightweight mode usable.
+            background_tasks.add_task(run_import_job, job.id)
+    result["job_id"] = job_id
+    return KnowledgeBundleImportRead(**result)
 
 
 @router.post("/knowledge-bases", response_model=KnowledgeBaseRead, status_code=201)
@@ -298,6 +472,11 @@ def delete_conversation(conversation_id: str, db: Db) -> ConversationDeleteRespo
         .values(conversation_id=None)
     )
     db.execute(
+        update(ExtractionProfile)
+        .where(ExtractionProfile.conversation_id == conversation.id)
+        .values(conversation_id=None)
+    )
+    db.execute(
         update(ImportJob).where(ImportJob.conversation_id == conversation.id).values(conversation_id=None)
     )
     db.execute(
@@ -326,12 +505,17 @@ def list_messages(conversation_id: str, db: Db) -> list[Message]:
 @router.post("/discover", response_model=DiscoveryResponse)
 async def discover(payload: DiscoveryRequest, db: Db) -> DiscoveryResponse:
     conversation = get_or_404(db, Conversation, payload.conversation_id)
+    profile, _ = await ExtractionProfileService().ensure_for_conversation(db, conversation, payload.query)
     job = ImportJob(
         conversation_id=conversation.id,
         knowledge_base_id=conversation.knowledge_base_id,
         query=payload.query,
         status=JobStatus.queued,
-        counts={"selection_mode": "manual", "source": "manual_discovery"},
+        counts={
+            "selection_mode": "manual",
+            "source": "manual_discovery",
+            "extraction_profile_id": profile.id,
+        },
     )
     db.add(job)
     db.commit()
@@ -528,7 +712,7 @@ def select_candidates(
         job.status = JobStatus.completed
         job.stage = "未新增，继续使用现有知识库"
         job.progress = 1.0
-        job.completed_at = datetime.now(timezone.utc)
+        job.completed_at = datetime.now(UTC)
         append_job_log(job, "completed", "用户选择新增 0 篇")
         db.commit()
         return job
@@ -717,8 +901,8 @@ async def upload_licensed_document(
         author_names = json.loads(authors_json)
         if not isinstance(author_names, list):
             raise ValueError
-    except (json.JSONDecodeError, ValueError):
-        raise HTTPException(400, "authors_json 必须是作者名字符串数组")
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(400, "authors_json 必须是作者名字符串数组") from exc
     authors = [{"name": str(name)} for name in author_names]
     fingerprint = title_author_fingerprint(title, authors)
     digest = sha256_bytes(content)
@@ -966,6 +1150,11 @@ async def chat(payload: ChatRequest, background_tasks: BackgroundTasks, db: Db) 
     conversation.index_version = kb.index_version
     db.commit()
 
+    profile, profile_created = await ExtractionProfileService().ensure_for_conversation(
+        db, conversation, payload.question
+    )
+    db.commit()
+
     agent = NanofiltrationRAGAgent(db, deep_thinking=payload.deep_thinking)
     try:
         result = await agent.answer(
@@ -979,6 +1168,17 @@ async def chat(payload: ChatRequest, background_tasks: BackgroundTasks, db: Db) 
     discovery_payload: dict | None = None
     literature_error: str | None = None
     answer = result.answer
+    profile_job = enqueue_profile_extraction(db, background_tasks, conversation, profile, result.evidence)
+    result.tool_calls.append(
+        {
+            "tool": "conversation_extraction_profile",
+            "profile_id": profile.id,
+            "profile_name": profile.name,
+            "profile_version": profile.version,
+            "created": profile_created,
+            "reuse_job_id": profile_job.id if profile_job else None,
+        }
+    )
     if payload.proactive_literature and payload.desired_new_count > 0 and result.needs_literature:
         discovery_job = ImportJob(
             conversation_id=conversation.id,
@@ -990,6 +1190,7 @@ async def chat(payload: ChatRequest, background_tasks: BackgroundTasks, db: Db) 
                 "selection_mode": "automatic",
                 "source": "chat_agent",
                 "auto_import_target": payload.desired_new_count,
+                "extraction_profile_id": profile.id,
             },
         )
         db.add(discovery_job)
@@ -1024,7 +1225,7 @@ async def chat(payload: ChatRequest, background_tasks: BackgroundTasks, db: Db) 
                 discovery_job.status = JobStatus.completed
                 discovery_job.stage = "没有去重后的可新增文献"
                 discovery_job.progress = 1.0
-                discovery_job.completed_at = datetime.now(timezone.utc)
+                discovery_job.completed_at = datetime.now(UTC)
                 counts = dict(discovery_job.counts or {})
                 counts["execution_state"] = "completed"
                 discovery_job.counts = counts
@@ -1130,7 +1331,7 @@ def review_knowledge_insight(
         raise HTTPException(400, "标记为实验验证时必须填写验证依据或实验记录")
     insight.status = payload.status
     insight.review_note = payload.review_note
-    insight.reviewed_at = datetime.now(timezone.utc)
+    insight.reviewed_at = datetime.now(UTC)
     db.commit()
     graph = GraphStore(get_settings())
     try:

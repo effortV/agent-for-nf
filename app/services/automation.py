@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import select
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import AutomationStatus, ImportJob, JobStatus, LiteratureAutomation
+from app.models import AutomationStatus, ExtractionProfile, ImportJob, JobStatus, LiteratureAutomation
 from app.services.discovery_service import DiscoveryService
 from app.services.import_service import create_documents_from_candidates
 from app.services.pipeline import append_job_log, run_import_job_async
@@ -79,7 +81,7 @@ def _finish_or_reschedule(db, automation: LiteratureAutomation) -> None:
             automation.error_message = "已达到自动采集总量上限"
     else:
         automation.status = AutomationStatus.active
-        automation.next_run_at = datetime.now(timezone.utc) + timedelta(minutes=automation.interval_minutes)
+        automation.next_run_at = datetime.now(UTC) + timedelta(minutes=automation.interval_minutes)
         automation.rq_job_id = enqueue_automation_cycle(
             automation.id,
             delay_minutes=automation.interval_minutes,
@@ -104,16 +106,23 @@ async def run_automation_cycle_async(automation_id: str) -> None:
                 db.commit()
             return
         automation.status = AutomationStatus.running
-        automation.last_run_at = datetime.now(timezone.utc)
+        automation.last_run_at = datetime.now(UTC)
         automation.next_run_at = None
         automation.cycles += 1
         automation.error_message = None
+        profile = db.scalar(
+            select(ExtractionProfile)
+            .where(ExtractionProfile.knowledge_base_id == automation.knowledge_base_id)
+            .order_by(ExtractionProfile.updated_at.desc())
+            .limit(1)
+        )
         job = ImportJob(
             conversation_id=automation.conversation_id,
             knowledge_base_id=automation.knowledge_base_id,
             query=automation.query,
             status=JobStatus.queued,
             stage=f"自动采集第 {automation.cycles} 轮",
+            counts={"extraction_profile_id": profile.id if profile else None},
         )
         db.add(job)
         db.flush()
@@ -133,7 +142,7 @@ async def run_automation_cycle_async(automation_id: str) -> None:
             job.status = JobStatus.completed
             job.stage = "自动采集已由用户停止"
             job.progress = 1.0
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = datetime.now(UTC)
             append_job_log(job, "stopped", "检索完成后收到停止/删除请求，本轮未继续导入")
             db.commit()
             _finish_or_reschedule(db, automation)
@@ -152,7 +161,7 @@ async def run_automation_cycle_async(automation_id: str) -> None:
             job.status = JobStatus.completed
             job.stage = "本轮没有去重后的新文献"
             job.progress = 1.0
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = datetime.now(UTC)
             append_job_log(job, "completed", "本轮没有去重后的新文献，将按计划继续检查")
         db.commit()
 

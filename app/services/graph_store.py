@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from app.config import Settings, get_settings
-from app.models import Document, ExtractedFact, KnowledgeInsight
+from app.models import Document, DocumentExtraction, ExtractedFact, ExtractionProfile, KnowledgeInsight
 
 
 class GraphStore:
@@ -102,7 +102,7 @@ class GraphStore:
         self.ensure_schema()
         with self.driver.session(database=self.settings.neo4j_database) as session:
             session.run(
-                "MATCH (d:Document {id: $id})-[:REPORTS]->(f:Fact) DETACH DELETE f",
+                "MATCH (d:Document {id: $id})-[:REPORTS]->(f:Fact) WHERE f.profile_id IS NULL DETACH DELETE f",
                 id=document.id,
             ).consume()
         self.upsert_document(document, facts)
@@ -111,6 +111,73 @@ class GraphStore:
                 "MATCH (e:Entity {knowledge_base_id: $kb}) WHERE NOT (e)<-[:ABOUT]-(:Fact) DELETE e",
                 kb=document.knowledge_base_id,
             ).consume()
+
+    def upsert_profile_extraction(
+        self,
+        document: Document,
+        profile: ExtractionProfile,
+        artifact: DocumentExtraction,
+    ) -> None:
+        """Persist versioned research facts without replacing other extraction schemes."""
+        if not self.driver:
+            return
+        self.ensure_schema()
+        with self.driver.session(database=self.settings.neo4j_database) as session:
+            session.run(
+                "MATCH (:Document {id: $document_id})-[:REPORTS]->(f:Fact {profile_id: $profile_id}) DETACH DELETE f",
+                document_id=document.id,
+                profile_id=profile.id,
+            ).consume()
+            session.run(
+                """
+                MERGE (d:Document {id: $id})
+                SET d.title=$title, d.doi=$doi, d.year=$year, d.knowledge_base_id=$kb,
+                    d.evidence_mode=$evidence_mode
+                """,
+                id=document.id,
+                title=document.title,
+                doi=document.doi_normalized,
+                year=document.publication_year,
+                kb=document.knowledge_base_id,
+                evidence_mode="metadata-only" if (document.metadata_json or {}).get("metadata_only") else "fulltext",
+            ).consume()
+            for index, fact in enumerate(artifact.facts_json or []):
+                subject = str(fact.get("subject") or document.title)
+                entity_key = f"{document.knowledge_base_id}:{subject.casefold()}"
+                fact_id = f"{artifact.id}:{index}"
+                session.run(
+                    """
+                    MATCH (d:Document {id: $document_id})
+                    MERGE (e:Entity {key: $entity_key})
+                    SET e.name=$subject, e.knowledge_base_id=$kb
+                    MERGE (f:Fact {id: $fact_id})
+                    SET f.profile_id=$profile_id, f.profile_name=$profile_name,
+                        f.type=$fact_type, f.predicate=$predicate, f.object_text=$object_text,
+                        f.value=$value, f.unit=$unit, f.conditions_json=$conditions_json,
+                        f.source_sentence=$source_sentence, f.page=$page, f.table_id=$table_id,
+                        f.confidence=$confidence, f.doi=$doi
+                    MERGE (d)-[:REPORTS]->(f)
+                    MERGE (f)-[:ABOUT]->(e)
+                    """,
+                    document_id=document.id,
+                    entity_key=entity_key,
+                    subject=subject,
+                    kb=document.knowledge_base_id,
+                    fact_id=fact_id,
+                    profile_id=profile.id,
+                    profile_name=profile.name,
+                    fact_type=str(fact.get("field") or "relation"),
+                    predicate=str(fact.get("predicate") or fact.get("field") or "reports"),
+                    object_text=fact.get("object_text"),
+                    value=fact.get("value") if isinstance(fact.get("value"), (int, float)) else None,
+                    unit=fact.get("unit"),
+                    conditions_json=json.dumps(fact.get("conditions") or {}, ensure_ascii=False),
+                    source_sentence=str(fact.get("source_sentence") or ""),
+                    page=fact.get("page"),
+                    table_id=fact.get("table_id"),
+                    confidence=float(fact.get("confidence") or 0.0),
+                    doi=document.doi_normalized,
+                ).consume()
 
     def upsert_insight(self, insight: KnowledgeInsight) -> None:
         if not self.driver:

@@ -114,3 +114,13 @@ API 文档位于 <http://localhost:8000/docs>。
 ```powershell
 docker compose --profile docker-ui up --build -d
 ```
+## 外接硬盘全文库
+
+项目默认把 WSL 中的 `/mnt/f/AI4Membrane lib` 以只读方式挂载到 API 和两个 Worker。确认 Windows 能看到
+`F:\AI4Membrane lib\AI4Membrane library.csv`，并在 `.env` 保留：
+
+```dotenv
+LOCAL_LIBRARY_HOST_PATH=/mnt/f/AI4Membrane lib
+```
+
+启动后在 Streamlit 的“文献采集与阅读”页点击“扫描/更新全文目录”。扫描只建立题录索引并核对附件，不会移动或修改外接硬盘文件。

@@ -39,6 +39,11 @@ x-app-env: &app-env
   DIRECT_WEB_MIN_INTERVAL_SECONDS: ${DIRECT_WEB_MIN_INTERVAL_SECONDS:-1.0}
   DIRECT_WEB_MAX_BYTES: ${DIRECT_WEB_MAX_BYTES:-104857600}
   DIRECT_HTML_MIN_CHARS: ${DIRECT_HTML_MIN_CHARS:-3000}
+  LOCAL_LIBRARY_ROOT: /library/AI4Membrane lib
+  LOCAL_LIBRARY_CATALOG: ${LOCAL_LIBRARY_CATALOG:-AI4Membrane library.csv}
+  LOCAL_LIBRARY_AUTO_SYNC: ${LOCAL_LIBRARY_AUTO_SYNC:-true}
+  LOCAL_LIBRARY_SEARCH_LIMIT: ${LOCAL_LIBRARY_SEARCH_LIMIT:-500}
+  EXTRACTION_PROFILE_DOCUMENT_LIMIT: ${EXTRACTION_PROFILE_DOCUMENT_LIMIT:-24}
 
 services:
   postgres:
@@ -149,6 +154,7 @@ services:
       - "${NF_BIND_HOST:-127.0.0.1}:8000:8000"
     volumes:
       - nf_models:/models
+      - "${LOCAL_LIBRARY_HOST_PATH:-/mnt/f/AI4Membrane lib}:/library/AI4Membrane lib:ro"
     depends_on:
       postgres:
         condition: service_healthy
@@ -172,6 +178,7 @@ services:
     stop_grace_period: 2m
     volumes:
       - nf_models:/models
+      - "${LOCAL_LIBRARY_HOST_PATH:-/mnt/f/AI4Membrane lib}:/library/AI4Membrane lib:ro"
     depends_on:
       api:
         condition: service_started
@@ -193,6 +200,7 @@ services:
     stop_grace_period: 2m
     volumes:
       - nf_models:/models
+      - "${LOCAL_LIBRARY_HOST_PATH:-/mnt/f/AI4Membrane lib}:/library/AI4Membrane lib:ro"
     depends_on:
       api:
         condition: service_started

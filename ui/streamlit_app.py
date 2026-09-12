@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -55,7 +55,43 @@ def api_bytes(path: str) -> bytes:
         response.raise_for_status()
         return response.content
     except httpx.HTTPError as exc:
-        raise RuntimeError(f"训练数据导出失败：{exc}") from exc
+        raise RuntimeError(f"文件导出失败：{exc}") from exc
+
+
+def render_local_library() -> None:
+    """Show the server-side, read-only full-text catalogue used before web APIs."""
+    st.markdown("### AI4Membrane 本地全文库")
+    try:
+        stats = api("GET", "/local-library")
+    except RuntimeError as exc:
+        st.error(str(exc))
+        return
+    if not stats.get("configured"):
+        st.warning(
+            "后端尚未发现 AI4Membrane library.csv。服务器应挂载到 "
+            "`/library/AI4Membrane lib`；本地 Docker 默认读取 `F:\\AI4Membrane lib`。"
+        )
+        return
+    cols = st.columns(4)
+    cols[0].metric("题录索引", stats.get("indexed_records", 0))
+    cols[1].metric("可用全文", stats.get("fulltext_records", 0))
+    cols[2].metric("附件缺失", stats.get("missing_attachments", 0))
+    cols[3].metric("目录状态", "已挂载" if stats.get("catalog_exists") else "缺少目录")
+    st.caption(
+        f"只读来源：{stats.get('root') or '—'} · 最近同步：{stats.get('last_sync_at') or '尚未同步'}。"
+        "检索时先查这里的全文，再用 OpenAlex、Crossref、Semantic Scholar 和 Elsevier 补新文献。"
+    )
+    if st.button("扫描/更新全文目录", key="sync-local-library", type="primary"):
+        try:
+            with st.spinner("正在扫描题录并核对附件，不会移动或改写 PDF……"):
+                stats = api("POST", "/local-library/sync?force=true")
+            st.success(
+                f"目录已更新：{stats.get('indexed_records', 0)} 条题录，"
+                f"{stats.get('fulltext_records', 0)} 篇全文可直接读取。"
+            )
+            st.rerun()
+        except RuntimeError as exc:
+            st.error(str(exc))
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -108,7 +144,7 @@ def conversation_labels(conversations: list[dict[str, Any]]) -> dict[str, str]:
             try:
                 parsed = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
                 if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
+                    parsed = parsed.replace(tzinfo=UTC)
                 timestamp = parsed.astimezone(china_tz).strftime("%m-%d %H:%M")
             except ValueError:
                 pass
@@ -501,7 +537,8 @@ def render_discovery_results(state_key: str, *, default_count: int) -> None:
     option_map = {
         item["candidate_id"]: (
             f"{item.get('publication_year') or '—'} | {item['title']} | "
-            f"DOI {item.get('doi') or '—'} | 相关性 {item['relevance_score']:.2f} | {item['source']}"
+            f"DOI {item.get('doi') or '—'} | 相关性 {item['relevance_score']:.2f} | "
+            f"{'AI4Membrane 本地全文' if item['source'] == 'local-library' else item['source']}"
         )
         for item in new_candidates
     }
@@ -1075,6 +1112,40 @@ def render_reader(conversation_id: str, knowledge_base_id: str) -> None:
             )
         else:
             st.info("该文献尚无结构化事实，仍可通过全文/摘要切片参与 RAG。")
+    try:
+        extractions = api("GET", f"/documents/{document_id}/extractions")
+    except RuntimeError:
+        extractions = []
+    if extractions:
+        with st.expander(f"按研究问题生成的版本化抽取（{len(extractions)}）", expanded=False):
+            st.caption("这些结果复用上方切片产生；切换研究方向不会重新解析 PDF，也不会覆盖旧方案。")
+            for extraction in extractions:
+                facts_json = extraction.get("facts_json") or []
+                st.markdown(
+                    f"**方案 {extraction['profile_id'][:8]} · {extraction['status']} · "
+                    f"{extraction.get('completed_batches', 0)}/{extraction.get('total_batches', 0)} 批 · "
+                    f"{len(facts_json)} 条事实**"
+                )
+                if extraction.get("error_message"):
+                    st.warning(extraction["error_message"])
+                if facts_json:
+                    st.dataframe(
+                        [
+                            {
+                                "字段": item.get("field"),
+                                "主体": item.get("subject"),
+                                "关系": item.get("predicate"),
+                                "结果": item.get("object_text") or item.get("value"),
+                                "单位": item.get("unit"),
+                                "章节": item.get("section"),
+                                "页码": item.get("page"),
+                                "置信度": item.get("confidence"),
+                            }
+                            for item in facts_json
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
 
 
 def render_upload(conversation_id: str) -> None:
@@ -1161,6 +1232,88 @@ def render_training_data(conversation: dict[str, Any]) -> None:
         "系统持续保存 instruction、input、output、RAG 证据、Agent 工具轨迹、评分、人工修订和审核状态。"
         "这里只导出科研问答数据，不包含 API Key、学校账号或密码。"
     )
+    with st.expander("研究抽取方案与版本", expanded=False):
+        st.caption(
+            "Agent 会根据研究问题自动生成字段方案。换研究方向时复用既有切片，只新增一个抽取版本；"
+            "原方案和原结果不会被覆盖。"
+        )
+        try:
+            profiles = api("GET", f"/knowledge-bases/{knowledge_base_id}/extraction-profiles")
+            if not profiles:
+                st.info("完成一次对话或手动检索后，会在这里生成第一套抽取方案。")
+            for profile in profiles[:30]:
+                fields = [
+                    item.get("name") if isinstance(item, dict) else str(item)
+                    for item in (profile.get("schema_json") or {}).get("fields", [])
+                ]
+                st.markdown(f"**v{profile['version']} · {profile['name']}**")
+                st.caption(f"研究问题：{profile['research_question']} · 模型：{profile.get('model_name') or '—'}")
+                st.write("抽取字段：" + "、".join(fields))
+        except RuntimeError as exc:
+            st.error(str(exc))
+
+    with st.expander("知识库迁移：导出/导入已学习结果", expanded=False):
+        st.caption(
+            "迁移包包含文献题录、解析切片、基础事实、版本化研究抽取和 AI 知识发现。"
+            "它不包含 API Key，也不重复打包外接硬盘中的 PDF；导入后只在目标机器本地重建 bge-m3/Chroma 和 Neo4j。"
+        )
+        export_col, import_col = st.columns(2)
+        with export_col:
+            bundle_key = f"knowledge-bundle-export-{knowledge_base_id}"
+            if st.button("生成迁移包", key=f"prepare-{bundle_key}", use_container_width=True):
+                try:
+                    with st.spinner("正在压缩已学习的文献、切片和抽取结果……"):
+                        st.session_state[bundle_key] = api_bytes(
+                            f"/knowledge-bases/{knowledge_base_id}/bundle/export"
+                        )
+                except RuntimeError as exc:
+                    st.error(str(exc))
+            bundle = st.session_state.get(bundle_key)
+            if bundle:
+                st.download_button(
+                    "导出可迁移知识包 ZIP",
+                    data=bundle,
+                    file_name=f"nf-atlas-{knowledge_base_id[:8]}-knowledge.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+        with import_col:
+            uploaded_bundle = st.file_uploader(
+                "导入 NF-Atlas 知识包",
+                type=["zip"],
+                key=f"knowledge-bundle-{knowledge_base_id}",
+            )
+            if st.button(
+                "导入并重建索引",
+                key=f"import-knowledge-bundle-{knowledge_base_id}",
+                disabled=uploaded_bundle is None,
+                use_container_width=True,
+            ):
+                try:
+                    with st.spinner("正在去重导入切片和抽取结果，并重建图谱/向量索引……"):
+                        result = api(
+                            "POST",
+                            f"/knowledge-bases/{knowledge_base_id}/bundle/import",
+                            files={
+                                "file": (
+                                    uploaded_bundle.name,
+                                    uploaded_bundle.getvalue(),
+                                    "application/zip",
+                                )
+                            },
+                        )
+                    st.success(
+                        f"导入完成：新增 {result['documents_added']} 篇、复用 {result['documents_reused']} 篇、"
+                        f"切片 {result['chunks']} 个、抽取方案 {result['profiles']} 套、"
+                        f"方案事实集 {result['extractions']} 份。Chroma/Neo4j 已提交后台重建。"
+                    )
+                    if result.get("job_id"):
+                        st.session_state.active_job = result["job_id"]
+                    if result.get("warnings"):
+                        st.warning("部分索引需稍后重建：" + "；".join(result["warnings"][:5]))
+                except RuntimeError as exc:
+                    st.error(str(exc))
+
     try:
         stats = api("GET", f"/training/stats?knowledge_base_id={quote(knowledge_base_id)}")
     except RuntimeError as exc:
@@ -1277,6 +1430,8 @@ with agent_tab:
     render_chat_module(conversation)
 with literature_tab:
     st.subheader("文献采集、自动化与阅读")
+    render_local_library()
+    st.divider()
     render_processing_center(conversation["knowledge_base_id"])
     st.divider()
     manual_tab, automatic_tab, reader_tab, public_url_tab, upload_tab = st.tabs(

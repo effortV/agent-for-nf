@@ -367,3 +367,57 @@ class HealthRead(BaseModel):
     hf_endpoint: str
     queue_mode: str
     missing_recommended_settings: list[str] = Field(default_factory=list)
+
+
+class LocalLibraryStatsRead(BaseModel):
+    configured: bool
+    root: str | None
+    catalog_exists: bool
+    indexed_records: int
+    fulltext_records: int
+    missing_attachments: int
+    last_sync_at: datetime | None = None
+
+
+class ExtractionProfileRead(ORMModel):
+    id: str
+    knowledge_base_id: str
+    conversation_id: str | None
+    name: str
+    version: int
+    research_question: str
+    extraction_schema: dict[str, Any] = Field(
+        validation_alias="schema_json",
+        serialization_alias="schema_json",
+    )
+    model_name: str | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class DocumentExtractionRead(ORMModel):
+    id: str
+    document_id: str
+    profile_id: str
+    status: str
+    total_batches: int
+    completed_batches: int
+    facts_json: list[dict[str, Any]]
+    error_message: str | None
+    model_name: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class KnowledgeBundleImportRead(BaseModel):
+    documents_added: int
+    documents_reused: int
+    chunks: int
+    facts: int
+    profiles: int
+    extractions: int
+    insights: int
+    index_version: int
+    job_id: str | None = None
+    warnings: list[str] = Field(default_factory=list)

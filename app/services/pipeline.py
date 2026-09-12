@@ -2,16 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import Chunk, Document, DocumentStatus, ImportJob, JobStatus, KnowledgeBase
-from app.services.dedupe import find_duplicate
+from app.models import (
+    Chunk,
+    Document,
+    DocumentExtraction,
+    DocumentStatus,
+    ExtractedFact,
+    ExtractionProfile,
+    ImportJob,
+    JobStatus,
+    KnowledgeBase,
+)
+from app.services.dedupe import find_duplicate, sha256_bytes
+from app.services.extraction_profiles import ExtractionProfileService
 from app.services.extractor import FactExtractor
 from app.services.fulltext import FullTextResolver, FullTextResult, FullTextUnavailable
 from app.services.graph_store import GraphStore
@@ -29,11 +40,12 @@ from app.services.task_control import (
 from app.services.vector_store import VectorStore
 
 
-def document_processing_priority(document: Document) -> tuple[int, int, int, int, float]:
+def document_processing_priority(document: Document) -> tuple[int, int, int, int, int, float]:
     """Process owned bytes and strong public-fulltext signals before metadata fallbacks."""
     fulltext_hint = (document.fulltext_url or "").casefold().split("?", 1)[0]
     direct_file_hint = fulltext_hint.endswith((".pdf", ".xml", ".jats"))
     return (
+        0 if (getattr(document, "metadata_json", None) or {}).get("local_library_path") else 1,
         0 if document.object_key else 1,
         0 if direct_file_hint else 1,
         0 if document.is_open_access and document.doi_normalized else 1,
@@ -42,9 +54,37 @@ def document_processing_priority(document: Document) -> tuple[int, int, int, int
     )
 
 
+def local_library_fulltext(document: Document) -> FullTextResult | None:
+    """Read a configured, read-only library attachment while preventing path escape."""
+    settings = get_settings()
+    relative = str((document.metadata_json or {}).get("local_library_path") or "").strip()
+    if not settings.local_library_root or not relative:
+        return None
+    root = settings.local_library_root.resolve()
+    candidate = (root / Path(relative.replace("\\", "/"))).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError("本地文献附件路径越出配置目录") from exc
+    if not candidate.is_file():
+        raise RuntimeError(f"本地文献全文不存在：{relative}")
+    content = candidate.read_bytes()
+    extension = candidate.suffix.lstrip(".").casefold() or "pdf"
+    content_types = {"pdf": "application/pdf", "xml": "application/xml", "html": "text/html", "htm": "text/html"}
+    return FullTextResult(
+        content=content,
+        content_type=content_types.get(extension, "application/octet-stream"),
+        extension=extension,
+        source="local-library",
+        url=f"library://{(document.metadata_json or {}).get('local_library_key') or candidate.name}",
+        license="user-provided-library",
+        sha256=sha256_bytes(content),
+    )
+
+
 def append_job_log(job: ImportJob, stage: str, message: str, document_id: str | None = None) -> None:
     entry = {
-        "time": datetime.now(timezone.utc).isoformat(),
+        "time": datetime.now(UTC).isoformat(),
         "stage": stage,
         "message": message,
     }
@@ -99,7 +139,7 @@ def update_current_document(
             "fulltext_source": document.fulltext_source,
             "has_saved_file": bool(document.object_key),
             "state": state,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
     )
     if chunks is not None:
@@ -138,14 +178,14 @@ def apply_control_checkpoint(db: Session, job: ImportJob, *, allow_pause: bool =
                 {
                     "state": "cancelled",
                     "stage": "已在单篇安全点停止",
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
                 }
             )
             counts["current_document"] = current
         job.counts = counts
         job.status = JobStatus.completed
         job.stage = "已取消；已入库文献保留"
-        job.completed_at = datetime.now(timezone.utc)
+        job.completed_at = datetime.now(UTC)
         if not was_terminal:
             append_job_log(job, "cancelled", "用户取消任务；已完成入库的文献和知识保留")
         db.commit()
@@ -165,7 +205,7 @@ def apply_control_checkpoint(db: Session, job: ImportJob, *, allow_pause: bool =
                 {
                     "state": "paused",
                     "stage": "已在单篇安全点暂停",
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
                 }
             )
             counts["current_document"] = current
@@ -206,7 +246,10 @@ async def process_document(
             document_progress=0.05,
         )
         db.commit()
-        if document.object_key and document.fulltext_source not in {None, "metadata-only"}:
+        local_result = local_library_fulltext(document)
+        if local_result:
+            result = local_result
+        elif document.object_key and document.fulltext_source not in {None, "metadata-only"}:
             content = storage.get_bytes(document.object_key)
             extension = Path(document.object_key).suffix.lstrip(".").lower() or "pdf"
             content_types = {"pdf": "application/pdf", "xml": "application/xml", "html": "text/html", "htm": "text/html"}
@@ -499,6 +542,42 @@ async def _index_parsed_document(
     document.metadata_json = metadata
     document.error_message = None if not metadata_only else document.error_message
     document.status = DocumentStatus.indexed
+
+    profile_id = str((job.counts or {}).get("extraction_profile_id") or "")
+    if profile_id:
+        profile = db.get(ExtractionProfile, profile_id)
+        if profile:
+            update_current_document(
+                job,
+                document,
+                position=position,
+                total=total,
+                stage=f"按研究方案抽取：{profile.name}",
+                document_progress=0.93,
+                content_mode=content_mode,
+                chunks=len(rows),
+                facts=len(facts),
+            )
+            db.commit()
+            try:
+                artifact = await ExtractionProfileService().extract_document(db, document, profile)
+                graph = GraphStore(settings)
+                try:
+                    graph.upsert_profile_extraction(document, profile, artifact)
+                finally:
+                    graph.close()
+                counts = dict(job.counts or {})
+                counts["profile_facts"] = int(counts.get("profile_facts") or 0) + len(artifact.facts_json or [])
+                job.counts = counts
+            except Exception as exc:
+                db.rollback()
+                job = db.get(ImportJob, job.id)
+                document = db.get(Document, document.id)
+                if job and document:
+                    counts = dict(job.counts or {})
+                    counts["profile_failed"] = int(counts.get("profile_failed") or 0) + 1
+                    job.counts = counts
+                    append_job_log(job, "profile_failed", f"研究方案抽取失败，可断点重试：{type(exc).__name__}", document.id)
     update_count(job, "indexed")
     update_current_document(
         job,
@@ -526,6 +605,148 @@ async def _index_parsed_document(
     return True
 
 
+async def run_profile_extraction_job(db: Session, job: ImportJob) -> None:
+    """Extract a new research schema from reusable chunks without re-reading PDFs."""
+    counts = dict(job.counts or {})
+    profile = db.get(ExtractionProfile, str(counts.get("extraction_profile_id") or ""))
+    if not profile:
+        raise RuntimeError("抽取方案不存在")
+    document_ids = list(dict.fromkeys(job.selected_document_ids or []))
+    documents = [item for item in (db.get(Document, item_id) for item_id in document_ids) if item]
+    total = max(1, len(documents))
+    completed = 0
+    for position, document in enumerate(documents, 1):
+        if apply_control_checkpoint(db, job, allow_pause=position < len(documents)) != ACTIVE:
+            return
+        chunks = db.scalar(select(func.count(Chunk.id)).where(Chunk.document_id == document.id)) or 0
+        update_current_document(
+            job,
+            document,
+            position=position,
+            total=total,
+            stage=f"复用 {chunks} 个切片，按方案抽取：{profile.name}",
+            document_progress=0.55,
+            content_mode="复用已解析全文",
+            chunks=int(chunks),
+        )
+        job.status = JobStatus.extracting
+        db.commit()
+        artifact = await ExtractionProfileService().extract_document(db, document, profile)
+        graph = GraphStore(get_settings())
+        try:
+            graph.upsert_profile_extraction(document, profile, artifact)
+        finally:
+            graph.close()
+        completed += int(artifact.status == "completed")
+        counts = dict(job.counts or {})
+        counts["profile_documents_completed"] = completed
+        counts["profile_facts"] = int(counts.get("profile_facts") or 0) + len(artifact.facts_json or [])
+        job.counts = counts
+        update_current_document(
+            job,
+            document,
+            position=position,
+            total=total,
+            stage="研究方案抽取完成",
+            document_progress=1.0,
+            content_mode="复用已解析全文",
+            chunks=int(chunks),
+            facts=len(artifact.facts_json or []),
+            state="completed",
+        )
+        db.commit()
+    job.status = JobStatus.completed
+    job.stage = "抽取方案应用完成"
+    job.progress = 1.0
+    job.completed_at = datetime.now(UTC)
+    counts = dict(job.counts or {})
+    counts["execution_state"] = "completed"
+    job.counts = counts
+    append_job_log(job, "completed", f"复用已有切片完成 {completed}/{len(documents)} 篇方案抽取")
+    db.commit()
+
+
+async def run_bundle_reindex_job(db: Session, job: ImportJob) -> None:
+    """Rebuild Chroma and Neo4j from an imported bundle without parsing or LLM calls."""
+    document_ids = list(dict.fromkeys(job.selected_document_ids or []))
+    documents = [item for item in (db.get(Document, item_id) for item_id in document_ids) if item]
+    total = max(1, len(documents))
+    indexed = 0
+    failed = 0
+    settings = get_settings()
+    for position, document in enumerate(documents, 1):
+        if apply_control_checkpoint(db, job, allow_pause=position < len(documents)) != ACTIVE:
+            return
+        chunks = list(db.scalars(select(Chunk).where(Chunk.document_id == document.id).order_by(Chunk.chunk_index)))
+        facts = list(db.scalars(select(ExtractedFact).where(ExtractedFact.document_id == document.id)))
+        update_current_document(
+            job,
+            document,
+            position=position,
+            total=total,
+            stage="复用迁移切片重建 Chroma/Neo4j",
+            document_progress=0.35,
+            content_mode="迁移包解析切片",
+            chunks=len(chunks),
+            facts=len(facts),
+        )
+        job.status = JobStatus.indexing
+        db.commit()
+        try:
+            graph = GraphStore(settings)
+            try:
+                graph.replace_document(document, facts)
+                artifacts = list(
+                    db.scalars(select(DocumentExtraction).where(DocumentExtraction.document_id == document.id))
+                )
+                for artifact in artifacts:
+                    profile = db.get(ExtractionProfile, artifact.profile_id)
+                    if profile:
+                        graph.upsert_profile_extraction(document, profile, artifact)
+            finally:
+                graph.close()
+            VectorStore(settings).replace_document(document, chunks)
+            indexed += 1
+            append_job_log(job, "indexed", f"迁移索引已重建：{document.title}", document.id)
+            state = "completed"
+            stage = "迁移索引重建完成"
+        except Exception as exc:
+            failed += 1
+            append_job_log(
+                job,
+                "failed",
+                f"迁移索引重建失败：{document.title}；{type(exc).__name__}: {str(exc)[:500]}",
+                document.id,
+            )
+            state = "failed"
+            stage = "迁移索引重建失败，可重试"
+        counts = dict(job.counts or {})
+        counts.update({"indexed": indexed, "failed": failed})
+        job.counts = counts
+        job.progress = position / total
+        update_current_document(
+            job,
+            document,
+            position=position,
+            total=total,
+            stage=stage,
+            document_progress=1.0,
+            content_mode="迁移包解析切片",
+            chunks=len(chunks),
+            facts=len(facts),
+            state=state,
+        )
+        db.commit()
+    job.status = JobStatus.completed if indexed else JobStatus.failed
+    job.stage = f"迁移索引重建完成：成功 {indexed}，失败 {failed}"
+    job.progress = 1.0
+    job.completed_at = datetime.now(UTC)
+    counts = dict(job.counts or {})
+    counts["execution_state"] = "completed" if indexed else "failed"
+    job.counts = counts
+    db.commit()
+
+
 async def run_import_job_async(job_id: str) -> None:
     db = SessionLocal()
     try:
@@ -546,6 +767,12 @@ async def run_import_job_async(job_id: str) -> None:
             counts["worker_queue"] = counts.get("worker_queue") or "fastapi-background"
         job.counts = counts
         db.commit()
+        if counts.get("job_type") == "extraction_profile":
+            await run_profile_extraction_job(db, job)
+            return
+        if counts.get("job_type") == "knowledge_bundle_reindex":
+            await run_bundle_reindex_job(db, job)
+            return
         # Filtering application-side is portable across SQLite and PostgreSQL JSON implementations.
         all_documents = [
             item
@@ -622,7 +849,7 @@ async def run_import_job_async(job_id: str) -> None:
         job.status = JobStatus.completed
         job.stage = "完成"
         job.progress = 1.0
-        job.completed_at = datetime.now(timezone.utc)
+        job.completed_at = datetime.now(UTC)
         append_job_log(
             job,
             "completed",

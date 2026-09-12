@@ -10,7 +10,16 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.models import Chunk, Conversation, Document, ExtractedFact, KnowledgeInsight, Message
+from app.models import (
+    Chunk,
+    Conversation,
+    Document,
+    DocumentExtraction,
+    ExtractedFact,
+    ExtractionProfile,
+    KnowledgeInsight,
+    Message,
+)
 from app.services.graph_store import GraphStore
 from app.services.knowledge_discovery import KnowledgeDiscoveryEngine
 from app.services.llm import DeepSeekClient
@@ -640,7 +649,7 @@ class NanofiltrationRAGAgent:
             .order_by(ExtractedFact.confidence.desc())
             .limit(limit)
         )
-        return [
+        output = [
             {
                 "source": "sql_facts",
                 "document_id": document.id,
@@ -660,6 +669,49 @@ class NanofiltrationRAGAgent:
             }
             for fact, document in rows
         ]
+        profile_rows = self.db.execute(
+            select(DocumentExtraction, Document, ExtractionProfile)
+            .join(Document, Document.id == DocumentExtraction.document_id)
+            .join(ExtractionProfile, ExtractionProfile.id == DocumentExtraction.profile_id)
+            .where(
+                Document.knowledge_base_id == kb,
+                DocumentExtraction.status == "completed",
+            )
+        )
+        lowered = [term.casefold() for term in terms if term.strip()]
+        for artifact, document, profile in profile_rows:
+            for fact in artifact.facts_json or []:
+                haystack = " ".join(
+                    str(fact.get(key) or "")
+                    for key in ("field", "subject", "predicate", "object_text", "source_sentence", "conditions")
+                ).casefold()
+                if not any(term in haystack for term in lowered):
+                    continue
+                output.append(
+                    {
+                        "source": "profile_facts",
+                        "document_id": document.id,
+                        "title": document.title,
+                        "doi": document.doi_normalized,
+                        "evidence_mode": "metadata-only"
+                        if (document.metadata_json or {}).get("metadata_only")
+                        else "fulltext",
+                        "profile_id": profile.id,
+                        "profile_name": profile.name,
+                        "subject": fact.get("subject"),
+                        "predicate": fact.get("predicate"),
+                        "object_text": fact.get("object_text"),
+                        "value": fact.get("value"),
+                        "unit": fact.get("unit"),
+                        "conditions": fact.get("conditions") or {},
+                        "quote": fact.get("source_sentence"),
+                        "page": fact.get("page"),
+                        "table_id": fact.get("table_id"),
+                        "confidence": float(fact.get("confidence") or 0.0),
+                    }
+                )
+        output.sort(key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
+        return output[:limit]
 
     def _keyword_search(
         self,
